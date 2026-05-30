@@ -113,6 +113,6 @@ Release.
 The workflow checks out the sibling `kws/deckr` repository because this crate
 uses the local Deckr Rust core path dependency. If the current branch or tag
 exists in `kws/deckr`, the workflow uses it; otherwise it uses Deckr's default
-branch. Set the repository variable `DECKR_REF` to force a specific Deckr ref.
-For private repository access, add a `DECKR_REPO_TOKEN` secret with read access
-to `kws/deckr`.
+branch. Set the repository variable `DECKR_REF` to force a specific Deckr branch,
+tag, or 40-character commit SHA. For private repository access, add a
+`DECKR_REPO_TOKEN` secret with read access to `kws/deckr`.

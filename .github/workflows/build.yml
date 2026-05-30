@@ -48,15 +48,21 @@ jobs:
           DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
-          if git ls-remote --exit-code origin "refs/heads/${DECKR_REF}" >/dev/null 2>&1; then
+          if [[ "${DECKR_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            git fetch --depth=1 origin "${DECKR_REF}"
+            git checkout --detach "${DECKR_REF}"
+          elif git ls-remote --exit-code origin "refs/heads/${DECKR_REF}" >/dev/null 2>&1; then
             git fetch --depth=1 origin "refs/heads/${DECKR_REF}"
             git checkout --detach FETCH_HEAD
           elif git ls-remote --exit-code origin "refs/tags/${DECKR_REF}" >/dev/null 2>&1; then
             git fetch --depth=1 origin "refs/tags/${DECKR_REF}"
             git checkout --detach FETCH_HEAD
           else
-            echo "Deckr ref '${DECKR_REF}' not found; using checked-out default branch."
+            echo "Deckr ref '${DECKR_REF}' not found." >&2
+            exit 1
           fi
+          test -f rust/deckr/Cargo.toml
+          echo "Using Deckr $(git rev-parse HEAD)"
 
       - name: Install system packages
         run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev
@@ -131,15 +137,21 @@ jobs:
           DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
-          if git ls-remote --exit-code origin "refs/heads/${DECKR_REF}" >/dev/null 2>&1; then
+          if [[ "${DECKR_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            git fetch --depth=1 origin "${DECKR_REF}"
+            git checkout --detach "${DECKR_REF}"
+          elif git ls-remote --exit-code origin "refs/heads/${DECKR_REF}" >/dev/null 2>&1; then
             git fetch --depth=1 origin "refs/heads/${DECKR_REF}"
             git checkout --detach FETCH_HEAD
           elif git ls-remote --exit-code origin "refs/tags/${DECKR_REF}" >/dev/null 2>&1; then
             git fetch --depth=1 origin "refs/tags/${DECKR_REF}"
             git checkout --detach FETCH_HEAD
           else
-            echo "Deckr ref '${DECKR_REF}' not found; using checked-out default branch."
+            echo "Deckr ref '${DECKR_REF}' not found." >&2
+            exit 1
           fi
+          test -f rust/deckr/Cargo.toml
+          echo "Using Deckr $(git rev-parse HEAD)"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
