@@ -22,6 +22,7 @@ pub trait Backend: Send + Sync + 'static {
 }
 
 pub trait DeviceHandle {
+    fn has_hid_input(&self) -> bool;
     fn probe(&mut self) -> Result<FipControlPacket>;
     fn clear_image(&mut self, page: u32) -> Result<FipControlPacket>;
     fn send_image(&mut self, frame: &[u8], page: u32) -> Result<FipControlPacket>;
@@ -60,6 +61,14 @@ impl DeviceCandidate {
 
     pub fn path_key(&self) -> String {
         format!("bus{:03}-addr{:03}", self.bus_number, self.address)
+    }
+
+    pub fn without_hid_input(&self) -> Self {
+        let mut candidate = self.clone();
+        candidate.hid_interface = None;
+        candidate.hid_interrupt_in = None;
+        candidate.hid_read_size = HID_REPORT_SIZE;
+        candidate
     }
 }
 
@@ -142,16 +151,34 @@ impl Backend for UsbBackend {
             &mut detached,
         )
         .with_context(|| format!("claiming vendor interface {}", candidate.vendor_interface))?;
+        let mut runtime_candidate = candidate.clone();
         if let Some(hid_interface) = candidate.hid_interface {
             if hid_interface != candidate.vendor_interface {
-                claim_interface(&mut handle, hid_interface, &mut claimed, &mut detached)
-                    .with_context(|| format!("claiming HID interface {hid_interface}"))?;
+                let claimed_before = claimed.len();
+                let detached_before = detached.len();
+                if let Err(error) =
+                    claim_interface(&mut handle, hid_interface, &mut claimed, &mut detached)
+                        .with_context(|| format!("claiming HID interface {hid_interface}"))
+                {
+                    rollback_interfaces(
+                        &mut handle,
+                        &mut claimed,
+                        claimed_before,
+                        &mut detached,
+                        detached_before,
+                    );
+                    tracing::warn!(
+                        "Continuing without Saitek FIP HID input for {}: {error:#}",
+                        candidate.path_key()
+                    );
+                    runtime_candidate = runtime_candidate.without_hid_input();
+                }
             }
         }
 
         Ok(Box::new(UsbFipHandle {
             handle,
-            candidate: candidate.clone(),
+            candidate: runtime_candidate,
             timeout,
             claimed,
             detached,
@@ -168,6 +195,10 @@ struct UsbFipHandle {
 }
 
 impl DeviceHandle for UsbFipHandle {
+    fn has_hid_input(&self) -> bool {
+        self.candidate.hid_interrupt_in.is_some()
+    }
+
     fn probe(&mut self) -> Result<FipControlPacket> {
         let reply = self.transceive(probe_packet(), None)?;
         validate_probe_reply(reply)?;
@@ -378,4 +409,19 @@ fn claim_interface(
         .with_context(|| format!("claiming interface {interface}"))?;
     claimed.push(interface);
     Ok(())
+}
+
+fn rollback_interfaces(
+    handle: &mut UsbDeviceHandle<GlobalContext>,
+    claimed: &mut Vec<u8>,
+    claimed_before: usize,
+    detached: &mut Vec<u8>,
+    detached_before: usize,
+) {
+    for interface in claimed.drain(claimed_before..).rev() {
+        let _ = handle.release_interface(interface);
+    }
+    for interface in detached.drain(detached_before..).rev() {
+        let _ = handle.attach_kernel_driver(interface);
+    }
 }

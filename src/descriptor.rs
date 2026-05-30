@@ -42,12 +42,12 @@ pub fn device_descriptor(
             .or_else(|| Some("Logitech/Saitek".to_string())),
         model: Some("Flight Instrument Panel".to_string()),
         serial_number: candidate.serial_number.clone(),
-        controls: control_descriptors(),
+        controls: control_descriptors(candidate.hid_interrupt_in.is_some()),
         capabilities: Vec::new(),
     }
 }
 
-pub fn control_descriptors() -> Vec<ControlDescriptor> {
+pub fn control_descriptors(input_enabled: bool) -> Vec<ControlDescriptor> {
     let mut controls = vec![ControlDescriptor {
         control_id: SCREEN_CONTROL_ID.to_string(),
         kind: "screen".to_string(),
@@ -63,55 +63,57 @@ pub fn control_descriptors() -> Vec<ControlDescriptor> {
         output_capabilities: vec![raster_output_capability(WIDTH as u32, HEIGHT as u32)],
     }];
 
-    controls.extend(
-        BUTTON_CONTROLS
-            .iter()
-            .map(|(id, label, x, y)| ControlDescriptor {
-                control_id: (*id).to_string(),
-                kind: "button".to_string(),
-                label: Some((*label).to_string()),
+    if input_enabled {
+        controls.extend(
+            BUTTON_CONTROLS
+                .iter()
+                .map(|(id, label, x, y)| ControlDescriptor {
+                    control_id: (*id).to_string(),
+                    kind: "button".to_string(),
+                    label: Some((*label).to_string()),
+                    geometry: Some(ControlGeometry {
+                        x: *x,
+                        y: *y,
+                        width: Some(1.0),
+                        height: Some(1.0),
+                        unit: "grid".to_string(),
+                    }),
+                    input_capabilities: vec![button_momentary_capability()],
+                    output_capabilities: Vec::new(),
+                }),
+        );
+
+        controls.extend([
+            ControlDescriptor {
+                control_id: "left_encoder".to_string(),
+                kind: "dial".to_string(),
+                label: Some("Left encoder".to_string()),
                 geometry: Some(ControlGeometry {
-                    x: *x,
-                    y: *y,
+                    x: 2.0,
+                    y: 0.0,
                     width: Some(1.0),
                     height: Some(1.0),
                     unit: "grid".to_string(),
                 }),
-                input_capabilities: vec![button_momentary_capability()],
+                input_capabilities: vec![encoder_relative_capability()],
                 output_capabilities: Vec::new(),
-            }),
-    );
-
-    controls.extend([
-        ControlDescriptor {
-            control_id: "left_encoder".to_string(),
-            kind: "dial".to_string(),
-            label: Some("Left encoder".to_string()),
-            geometry: Some(ControlGeometry {
-                x: 2.0,
-                y: 0.0,
-                width: Some(1.0),
-                height: Some(1.0),
-                unit: "grid".to_string(),
-            }),
-            input_capabilities: vec![encoder_relative_capability()],
-            output_capabilities: Vec::new(),
-        },
-        ControlDescriptor {
-            control_id: "right_encoder".to_string(),
-            kind: "dial".to_string(),
-            label: Some("Right encoder".to_string()),
-            geometry: Some(ControlGeometry {
-                x: 3.0,
-                y: 0.0,
-                width: Some(1.0),
-                height: Some(1.0),
-                unit: "grid".to_string(),
-            }),
-            input_capabilities: vec![encoder_relative_capability()],
-            output_capabilities: Vec::new(),
-        },
-    ]);
+            },
+            ControlDescriptor {
+                control_id: "right_encoder".to_string(),
+                kind: "dial".to_string(),
+                label: Some("Right encoder".to_string()),
+                geometry: Some(ControlGeometry {
+                    x: 3.0,
+                    y: 0.0,
+                    width: Some(1.0),
+                    height: Some(1.0),
+                    unit: "grid".to_string(),
+                }),
+                input_capabilities: vec![encoder_relative_capability()],
+                output_capabilities: Vec::new(),
+            },
+        ]);
+    }
 
     controls
 }
@@ -370,6 +372,26 @@ mod tests {
             .iter()
             .any(|control| control.control_id == "s1"));
         assert!(descriptor
+            .controls
+            .iter()
+            .any(|control| control.control_id == "left_encoder"));
+    }
+
+    #[test]
+    fn descriptor_exposes_display_only_when_hid_is_unavailable() {
+        let descriptor = device_descriptor(
+            &sample_candidate().without_hid_input(),
+            "fip",
+            "fingerprint",
+        );
+
+        assert_eq!(descriptor.controls.len(), 1);
+        assert_eq!(descriptor.controls[0].control_id, SCREEN_CONTROL_ID);
+        assert!(!descriptor
+            .controls
+            .iter()
+            .any(|control| control.control_id == "s1"));
+        assert!(!descriptor
             .controls
             .iter()
             .any(|control| control.control_id == "left_encoder"));

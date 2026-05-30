@@ -990,6 +990,11 @@ fn device_worker(
     let local_device_id = descriptor.hardware_id();
     let fingerprint = local_device_id.clone();
     let mut handle = backend.open(&descriptor, USB_TIMEOUT)?;
+    let runtime_descriptor = if handle.has_hid_input() {
+        descriptor.clone()
+    } else {
+        descriptor.without_hid_input()
+    };
     let probe_reply = handle.probe()?;
     debug!(
         "Saitek FIP probe reply request=0x{:02x} header_error=0x{:08x} request_error=0x{:08x}",
@@ -1001,7 +1006,7 @@ fn device_worker(
             path_key: path_key.clone(),
             device_id: local_device_id.clone(),
             command_tx: command_tx.clone(),
-            device: device_descriptor(&descriptor, &local_device_id, &fingerprint),
+            device: device_descriptor(&runtime_descriptor, &local_device_id, &fingerprint),
         })
         .ok();
 
@@ -1043,7 +1048,7 @@ fn device_worker(
         }
 
         let Some(report) = handle.read_hid_report(READ_TIMEOUT)? else {
-            if descriptor.hid_interrupt_in.is_none() {
+            if !handle.has_hid_input() {
                 thread::sleep(READ_TIMEOUT);
             }
             continue;
@@ -1161,6 +1166,10 @@ mod tests {
     }
 
     impl DeviceHandle for FakeHandle {
+        fn has_hid_input(&self) -> bool {
+            true
+        }
+
         fn probe(&mut self) -> Result<FipControlPacket> {
             self.state.lock().unwrap().commands.push(REQ_PROBE);
             Ok(FipControlPacket {

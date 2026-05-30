@@ -56,6 +56,13 @@ interface and HID input interface. A development udev rule can grant access:
 SUBSYSTEM=="usb", ATTR{idVendor}=="06a3", ATTR{idProduct}=="a2ae", MODE="0666"
 ```
 
+## macOS USB Access
+
+macOS may keep the FIP's HID input interface attached to the system HID stack.
+The manager treats HID input as optional: if libusb cannot claim that interface,
+it continues as a display-only hardware manager. The vendor-specific display
+interface is still required.
+
 ## Build
 
 ```sh
