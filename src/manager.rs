@@ -145,7 +145,7 @@ impl SaitekRemoteManager {
                     runtime.concord_contracts().clone(),
                     runtime.concord_tokens().clone(),
                 ),
-                EndpointAddress::parse(&hardware_manager_address(&self.manager_id))?,
+                EndpointAddress::parse(hardware_manager_address(&self.manager_id))?,
                 self.session_id.clone(),
             )?
             .profile(HARDWARE_CLAIM_PROFILE_ID.to_string()),
