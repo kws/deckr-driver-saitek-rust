@@ -18,6 +18,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  BIN_NAME: deckr-saitek-manager
+  DRIVER_DIR: deckr-driver-saitek-rust
+  DECKR_REPOSITORY: kws/deckr
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -28,6 +31,32 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          path: ${{ env.DRIVER_DIR }}
+
+      - name: Check out Deckr dependency
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.DECKR_REPOSITORY }}
+          path: deckr
+          token: ${{ secrets.DECKR_REPO_TOKEN || github.token }}
+
+      - name: Align Deckr dependency ref when available
+        shell: bash
+        working-directory: deckr
+        env:
+          DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code origin "refs/heads/${DECKR_REF}" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "refs/heads/${DECKR_REF}"
+            git checkout --detach FETCH_HEAD
+          elif git ls-remote --exit-code origin "refs/tags/${DECKR_REF}" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "refs/tags/${DECKR_REF}"
+            git checkout --detach FETCH_HEAD
+          else
+            echo "Deckr ref '${DECKR_REF}' not found; using checked-out default branch."
+          fi
 
       - name: Install system packages
         run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev
@@ -38,10 +67,140 @@ jobs:
           components: rustfmt, clippy
 
       - name: Check formatting
+        working-directory: ${{ env.DRIVER_DIR }}
         run: cargo fmt --check
 
       - name: Run clippy
+        working-directory: ${{ env.DRIVER_DIR }}
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run unit tests
+        working-directory: ${{ env.DRIVER_DIR }}
         run: cargo test
+
+  linux-cross-build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            image: deckr-saitek-cross:x86_64-unknown-linux-gnu
+            dockerfile: docker/rust-cross/x86_64-unknown-linux-gnu.Dockerfile
+            archive: deckr-saitek-manager-linux-x86_64
+            cflags: ""
+            rustflags: ""
+          - target: aarch64-unknown-linux-gnu
+            image: deckr-saitek-cross:aarch64-unknown-linux-gnu
+            dockerfile: docker/rust-cross/aarch64-unknown-linux-gnu.Dockerfile
+            archive: deckr-saitek-manager-linux-aarch64
+            cflags: ""
+            rustflags: ""
+          - target: armv7-unknown-linux-gnueabihf
+            image: deckr-saitek-cross:armv7-unknown-linux-gnueabihf
+            dockerfile: docker/rust-cross/armv7-unknown-linux-gnueabihf.Dockerfile
+            archive: deckr-saitek-manager-linux-armv7hf
+            cflags: ""
+            rustflags: ""
+          - target: arm-unknown-linux-gnueabihf
+            image: deckr-saitek-cross:arm-unknown-linux-gnueabihf
+            dockerfile: docker/rust-cross/arm-unknown-linux-gnueabihf.Dockerfile
+            archive: deckr-saitek-manager-linux-armv6hf
+            cflags: "-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+            rustflags: "-C target-cpu=arm1176jzf-s"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          path: ${{ env.DRIVER_DIR }}
+
+      - name: Check out Deckr dependency
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.DECKR_REPOSITORY }}
+          path: deckr
+          token: ${{ secrets.DECKR_REPO_TOKEN || github.token }}
+
+      - name: Align Deckr dependency ref when available
+        shell: bash
+        working-directory: deckr
+        env:
+          DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code origin "refs/heads/${DECKR_REF}" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "refs/heads/${DECKR_REF}"
+            git checkout --detach FETCH_HEAD
+          elif git ls-remote --exit-code origin "refs/tags/${DECKR_REF}" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "refs/tags/${DECKR_REF}"
+            git checkout --detach FETCH_HEAD
+          else
+            echo "Deckr ref '${DECKR_REF}' not found; using checked-out default branch."
+          fi
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build cross image
+        run: docker build -f "${DRIVER_DIR}/${{ matrix.dockerfile }}" -t "${{ matrix.image }}" "${DRIVER_DIR}"
+
+      - name: Build release binary
+        env:
+          CROSS_CONFIG: ${{ env.DRIVER_DIR }}/Cross.toml
+          CROSS_CONTAINER_OPTS: --volume ${{ github.workspace }}:${{ github.workspace }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/${{ env.DRIVER_DIR }}/target
+          CFLAGS_arm_unknown_linux_gnueabihf: ${{ matrix.cflags }}
+          CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cross build --manifest-path "${DRIVER_DIR}/Cargo.toml" --release --target "${{ matrix.target }}"
+
+      - name: Package binary
+        working-directory: ${{ env.DRIVER_DIR }}
+        run: |
+          set -euo pipefail
+          package="dist/${{ matrix.archive }}"
+          mkdir -p "${package}"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "${package}/"
+          tar -czf "dist/${{ matrix.archive }}.tar.gz" -C dist "${{ matrix.archive }}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ env.DRIVER_DIR }}/dist/${{ matrix.archive }}.tar.gz
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    needs:
+      - lint-and-test
+      - linux-cross-build
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deckr-saitek-manager-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create or update release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/* --clobber
+          else
+            gh release create "${tag}" dist/* --title "${tag}" --generate-notes
+          fi

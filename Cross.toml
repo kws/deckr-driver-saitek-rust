@@ -1,0 +1,17 @@
+[target.x86_64-unknown-linux-gnu]
+image = "deckr-saitek-cross:x86_64-unknown-linux-gnu"
+
+[target.aarch64-unknown-linux-gnu]
+image = "deckr-saitek-cross:aarch64-unknown-linux-gnu"
+
+[target.armv7-unknown-linux-gnueabihf]
+image = "deckr-saitek-cross:armv7-unknown-linux-gnueabihf"
+
+[target.arm-unknown-linux-gnueabihf]
+image = "deckr-saitek-cross:arm-unknown-linux-gnueabihf"
+
+[build.env]
+passthrough = [
+  "CFLAGS_arm_unknown_linux_gnueabihf",
+  "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS",
+]

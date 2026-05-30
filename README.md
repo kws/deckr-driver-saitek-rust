@@ -76,3 +76,43 @@ If you use `just`, the same commands are available as:
 just build
 just test
 ```
+
+## Cross-platform builds
+
+The repo includes a `cross` setup for supported Linux deployment targets:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `armv7-unknown-linux-gnueabihf`
+- `arm-unknown-linux-gnueabihf`
+
+The `aarch64-unknown-linux-gnu` target covers 64-bit Raspberry Pi OS on newer
+boards, `armv7-unknown-linux-gnueabihf` covers 32-bit ARMv7 boards, and
+`arm-unknown-linux-gnueabihf` keeps an ARMv6/Raspberry Pi 1/Zero-compatible
+build.
+
+Build the custom `cross` images first:
+
+```sh
+just cross-images
+```
+
+Then build release binaries for the supported Linux targets:
+
+```sh
+just release
+```
+
+## GitHub Actions
+
+The build workflow runs formatting, clippy, tests, and release builds for the
+Linux Intel and Raspberry Pi targets. Pushing a tag that starts with `v`, such
+as `v0.1.0`, packages the binaries and creates or updates the matching GitHub
+Release.
+
+The workflow checks out the sibling `kws/deckr` repository because this crate
+uses the local Deckr Rust core path dependency. If the current branch or tag
+exists in `kws/deckr`, the workflow uses it; otherwise it uses Deckr's default
+branch. Set the repository variable `DECKR_REF` to force a specific Deckr ref.
+For private repository access, add a `DECKR_REPO_TOKEN` secret with read access
+to `kws/deckr`.
