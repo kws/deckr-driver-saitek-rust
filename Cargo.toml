@@ -1,0 +1,37 @@
+[package]
+name = "deckr-saitek-manager"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone Rust Saitek Flight Instrument Panel manager for Deckr"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/kws/deckr-driver-saitek-rust"
+homepage = "https://github.com/kws/deckr-driver-saitek-rust"
+documentation = "https://github.com/kws/deckr-driver-saitek-rust#readme"
+
+[[bin]]
+name = "deckr-saitek-manager"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
+deckr = { path = "../deckr/rust/deckr", features = ["nats"] }
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rusb = "0.9"
+serde_json = "1.0"
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.23", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
