@@ -428,12 +428,11 @@ async fn reconcile_routing_current_state(
     let contracts = concord
         .find_contracts(Some(HARDWARE_CLAIM_PROFILE_ID))
         .await?;
-    let (manager_endpoint, manager_session, advertisement_id, known_devices) = {
+    let (manager_endpoint, manager_session, known_devices) = {
         let state = shared.lock().await;
         (
             state.endpoint.clone(),
             state.session_id.clone(),
-            state.advertisement_id.clone(),
             state.devices.keys().cloned().collect::<HashSet<_>>(),
         )
     };
@@ -461,9 +460,7 @@ async fn reconcile_routing_current_state(
                 continue;
             }
         };
-        if terms.manager_endpoint != manager_endpoint
-            || terms.manager_advertisement_id != advertisement_id
-        {
+        if terms.manager_endpoint != manager_endpoint {
             continue;
         }
 
