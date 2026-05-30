@@ -57,7 +57,7 @@ pub fn control_descriptors(input_enabled: bool) -> Vec<ControlDescriptor> {
             y: 0.0,
             width: Some(4.0),
             height: Some(3.0),
-            unit: "relative".to_string(),
+            unit: "grid".to_string(),
         }),
         input_capabilities: Vec::new(),
         output_capabilities: vec![raster_output_capability(WIDTH as u32, HEIGHT as u32)],
@@ -267,13 +267,13 @@ fn raster_output_capability(width: u32, height: u32) -> CapabilityDescriptor {
             },
             CapabilityConstraint {
                 constraint_type: "fixed".to_string(),
-                subject: "channelOrder".to_string(),
+                subject: "channel_order".to_string(),
                 value: Some(json!("bgr")),
                 ..Default::default()
             },
             CapabilityConstraint {
                 constraint_type: "fixed".to_string(),
-                subject: "rowOrder".to_string(),
+                subject: "row_order".to_string(),
                 value: Some(json!("bottom-up")),
                 ..Default::default()
             },
