@@ -26,8 +26,9 @@ big-endian bitmask.
 
 The manager participates as `hardware_manager:<manager-id>` on the
 `hardware_messages` lane. By default it uses `saitek-rust-<hostname>`.
-Hardware discovery is advertised through Beacon, and device command/input routing
-is fenced by valid Concord hardware-claim contracts and participant tokens.
+Hardware discovery candidates are advertised through Beacon. After a controller
+claim is negotiated, device command/input routing is fenced only by valid
+Concord hardware-claim contracts and participant tokens.
 
 ```sh
 deckr-saitek-manager \
