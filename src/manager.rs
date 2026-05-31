@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -8,16 +8,15 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use deckr::beacon::{AdvertisementHandle, BeaconAdvertiser};
-use deckr::concord::{ConcordCoordinator, ConcordParticipantManager, ContractValidityStatus};
+use deckr::concord::{ConcordCoordinator, ConcordParticipantManager};
 use deckr::endpoint::{hardware_manager_address, EndpointAddress};
-use deckr::keys::concord_contracts_prefix;
+use deckr::hardware::{hardware_beacon_payload, HardwareClaimRouting};
 use deckr::lanes::{
     DeckrMessage, DeviceRef, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
 };
 use deckr::nats::{NatsDeckrRuntime, NatsStateStore};
 use deckr::profiles::hardware::{
-    HardwareAdvertisementDevice, HardwareBeaconPayload, HardwareClaimTerms, ProfileCapacity,
-    HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID,
+    HardwareBeaconPayload, HardwareClaimTerms, HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID,
 };
 use deckr::state::DEFAULT_STATE_RENEWAL_INTERVAL_SECONDS;
 use futures_util::StreamExt;
@@ -34,7 +33,6 @@ use crate::descriptor::{
 };
 use crate::image::encoded_image_to_fip_frame;
 use crate::protocol::{changed_events, decode_hid_mask, ByteOrder};
-use crate::routing::{ClaimRoute, RoutingState};
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
@@ -173,12 +171,7 @@ impl SaitekRemoteManager {
         ));
         tasks.spawn(inbound_command_loop(runtime.clone(), shared.clone()));
         tasks.spawn(hardware_advertisement_loop(runtime.clone(), shared.clone()));
-        tasks.spawn(concord_contract_watch_loop(
-            runtime.clone(),
-            shared.clone(),
-            claim_manager.clone(),
-        ));
-        tasks.spawn(concord_token_watch_loop(
+        tasks.spawn(concord_state_watch_loop(
             runtime.clone(),
             shared.clone(),
             claim_manager.clone(),
@@ -225,7 +218,7 @@ struct ManagerState {
     advertisement_id: String,
     devices: BTreeMap<String, deckr::lanes::DeviceDescriptor>,
     command_map: HashMap<String, Sender<RuntimeCommand>>,
-    routing: RoutingState,
+    routing: HardwareClaimRouting,
     advertisement_handle: Option<AdvertisementHandle>,
     advertisement_dirty: bool,
 }
@@ -241,42 +234,21 @@ impl ManagerState {
             advertisement_id,
             devices: BTreeMap::new(),
             command_map: HashMap::new(),
-            routing: RoutingState::default(),
+            routing: HardwareClaimRouting::default(),
             advertisement_handle: None,
             advertisement_dirty: false,
         }
     }
 
     fn hardware_payload(&self) -> Result<HardwareBeaconPayload> {
-        Ok(HardwareBeaconPayload {
-            profile: deckr::profiles::hardware::HARDWARE_PROFILE_ID.to_string(),
-            manager_id: self.manager_id.clone(),
-            manager_endpoint: EndpointAddress::parse(&self.endpoint)?,
-            session_id: self.session_id.clone(),
-            labels: BTreeMap::new(),
-            devices: self
-                .devices
-                .iter()
-                .map(|(device_id, descriptor)| {
-                    (
-                        device_id.clone(),
-                        HardwareAdvertisementDevice {
-                            capacity: ProfileCapacity {
-                                total_instances: Some(1),
-                                claimed_instances: 0,
-                                available_instances: Some(1),
-                            },
-                            device_ref: DeviceRef {
-                                manager_id: self.manager_id.clone(),
-                                device_id: device_id.clone(),
-                                fingerprint: Some(descriptor.fingerprint.clone()),
-                            },
-                            descriptor: descriptor.clone(),
-                        },
-                    )
-                })
-                .collect(),
-        })
+        Ok(hardware_beacon_payload(
+            &self.manager_id,
+            EndpointAddress::parse(&self.endpoint)?,
+            &self.session_id,
+            BTreeMap::new(),
+            &self.devices,
+            &self.routing.claimed_device_ids(),
+        )?)
     }
 }
 
@@ -371,54 +343,23 @@ async fn withdraw_hardware_advertisement_safely(
     }
 }
 
-async fn concord_contract_watch_loop(
+async fn concord_state_watch_loop(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
     claim_manager: Arc<Mutex<HardwareClaimManager>>,
 ) -> Result<()> {
     loop {
-        match runtime
-            .concord_contracts()
-            .wait_for_change(concord_contracts_prefix())
-            .await
-        {
-            Ok(()) => {
+        match runtime.wait_for_concord_change().await {
+            Ok(source) => {
                 reconcile_routing_current_state(
                     shared.clone(),
                     claim_manager.clone(),
-                    "contract watch",
+                    source.reason(),
                 )
                 .await?
             }
             Err(error) => {
-                warn!("Saitek Concord contract watch is unavailable; watch will retry: {error:#}");
-                time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
-            }
-        }
-    }
-}
-
-async fn concord_token_watch_loop(
-    runtime: Arc<NatsDeckrRuntime>,
-    shared: Arc<Mutex<ManagerState>>,
-    claim_manager: Arc<Mutex<HardwareClaimManager>>,
-) -> Result<()> {
-    loop {
-        match runtime
-            .concord_tokens()
-            .wait_for_change(concord_contracts_prefix())
-            .await
-        {
-            Ok(()) => {
-                reconcile_routing_current_state(
-                    shared.clone(),
-                    claim_manager.clone(),
-                    "token watch",
-                )
-                .await?
-            }
-            Err(error) => {
-                warn!("Saitek Concord token watch is unavailable; watch will retry: {error:#}");
+                warn!("Saitek Concord state watch is unavailable; watch will retry: {error:#}");
                 time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
             }
         }
@@ -452,12 +393,10 @@ async fn reconcile_routing_current_state(
         let state = shared.lock().await;
         (
             state.endpoint.clone(),
-            state.devices.keys().cloned().collect::<HashSet<_>>(),
+            state.devices.keys().cloned().collect::<BTreeSet<_>>(),
         )
     };
     let manager_endpoint = EndpointAddress::parse(&manager_endpoint)?;
-    let mut next_claims = HashMap::<String, ClaimRoute>::new();
-    let mut invalid_claim_devices = HashSet::<String>::new();
 
     let managed_contracts = {
         let mut claim_manager = claim_manager.lock().await;
@@ -487,70 +426,26 @@ async fn reconcile_routing_current_state(
             .await?
     };
 
-    for managed in managed_contracts {
-        let contract = managed.contract;
-        if !contract.participants.contains(&manager_endpoint) {
-            continue;
-        }
-        let Some(terms_value) = managed.record.terms.clone() else {
-            continue;
-        };
-        let terms = match HardwareClaimTerms::from_value(terms_value) {
-            Ok(terms) => terms,
-            Err(error) => {
-                warn!(
-                    "Ignoring invalid Saitek hardware claim contract {}: {error}",
-                    contract.key
-                );
-                continue;
-            }
-        };
-        if terms.manager_endpoint != manager_endpoint {
-            continue;
-        }
-
-        let validity = managed.validity;
-        if validity.status != ContractValidityStatus::Valid {
-            for device in &terms.devices {
-                if known_devices.contains(&device.device_ref.device_id) {
-                    invalid_claim_devices.insert(device.device_ref.device_id.clone());
-                }
-            }
-            continue;
-        }
-
-        let controller_endpoint = terms.controller_endpoint.to_string();
-        let Some(controller_token) = validity.tokens.get(&controller_endpoint) else {
-            continue;
-        };
-        for device in &terms.devices {
-            if !known_devices.contains(&device.device_ref.device_id) {
-                continue;
-            }
-            next_claims.insert(
-                device.device_ref.device_id.clone(),
-                ClaimRoute {
-                    controller_endpoint: controller_endpoint.clone(),
-                    controller_session_id: controller_token.session_id.clone(),
-                    contract_key: contract.key.clone(),
-                    claim_id: terms.claim_id.clone(),
-                },
-            );
-        }
-    }
-
     debug!("Reconciling Saitek routing current state via {reason}");
-    let senders_to_reset = {
+    let (senders_to_reset, ignored_claims) = {
         let mut state = shared.lock().await;
-        invalid_claim_devices.retain(|device_id| !next_claims.contains_key(device_id));
-        let devices_to_reset = state
-            .routing
-            .reconcile_snapshot(next_claims, invalid_claim_devices);
-        devices_to_reset
+        let reconcile =
+            state
+                .routing
+                .reconcile_claims(&managed_contracts, &manager_endpoint, &known_devices);
+        let senders = reconcile
+            .reset_devices
             .into_iter()
             .filter_map(|device_id| state.command_map.get(&device_id).cloned())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (senders, reconcile.ignored_claims)
     };
+    for ignored in ignored_claims {
+        warn!(
+            "Ignoring invalid Saitek hardware claim contract {}: {}",
+            ignored.contract_key, ignored.reason
+        );
+    }
     for sender in senders_to_reset {
         let _ = sender.send(RuntimeCommand::ResetDevice);
     }
@@ -712,6 +607,12 @@ async fn route_inbound_command(
         if envelope.recipient_endpoint() != Some(state.endpoint.as_str()) {
             return Ok(());
         }
+        if !envelope.is_directly_deliverable_to(
+            &EndpointAddress::parse(&state.endpoint)?,
+            &state.session_id,
+        )? {
+            return Ok(());
+        }
         if subject_manager_id != state.manager_id {
             return Ok(());
         }
@@ -726,7 +627,7 @@ async fn route_inbound_command(
             .routing
             .claim_recipient(&device_id)
             .is_none_or(|recipient| {
-                recipient.endpoint != envelope.sender
+                recipient.endpoint.as_str() != envelope.sender
                     || recipient.session_id != envelope.sender_session_id
             })
         {
@@ -1063,6 +964,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::{FipControlPacket, REQ_CLEAR_IMAGE, REQ_PROBE, REQ_SET_IMAGE};
+    use deckr::hardware::HardwareClaimRoute;
 
     #[derive(Clone)]
     struct FakeBackend {
@@ -1320,8 +1222,8 @@ mod tests {
             state.routing.reconcile_snapshot(
                 HashMap::from([(
                     "fip".to_string(),
-                    ClaimRoute {
-                        controller_endpoint: "controller:main".to_string(),
+                    HardwareClaimRoute {
+                        controller_endpoint: EndpointAddress::parse("controller:main").unwrap(),
                         controller_session_id: "s1".to_string(),
                         contract_key: "contracts.claim.1.meta".to_string(),
                         claim_id: "claim-1".to_string(),
@@ -1341,6 +1243,20 @@ mod tests {
         )
         .unwrap();
         route_inbound_command(shared.clone(), wrong).await.unwrap();
+        assert!(command_rx.try_recv().is_err());
+
+        let stale_manager_session = DeckrMessage::hardware_command(
+            "main",
+            "s1",
+            "saitek-main",
+            "stale-manager-session",
+            "fip",
+            raster_command("set_frame"),
+        )
+        .unwrap();
+        route_inbound_command(shared.clone(), stale_manager_session)
+            .await
+            .unwrap();
         assert!(command_rx.try_recv().is_err());
 
         let right = DeckrMessage::hardware_command(

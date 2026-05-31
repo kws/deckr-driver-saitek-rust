@@ -5,4 +5,3 @@ pub mod descriptor;
 pub mod image;
 pub mod manager;
 pub mod protocol;
-mod routing;
