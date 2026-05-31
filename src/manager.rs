@@ -8,7 +8,10 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use deckr::beacon::{AdvertisementHandle, BeaconAdvertiser};
-use deckr::concord::{ConcordCoordinator, ConcordManagedContract, ConcordParticipantManager};
+use deckr::concord::{
+    ConcordCoordinator, ConcordManagedContract, ConcordParticipantManager, ContractHandle,
+    ContractRecord,
+};
 use deckr::endpoint::{hardware_manager_address, EndpointAddress};
 use deckr::hardware::{hardware_beacon_payload, HardwareClaimRouting};
 use deckr::lanes::{
@@ -75,6 +78,33 @@ enum WorkerEvent {
         device_id: String,
     },
     Failed {
+        path_key: String,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum WorkerReport {
+    Connected {
+        worker_id: u64,
+        path_key: String,
+        device_id: String,
+        command_tx: Sender<RuntimeCommand>,
+        device: deckr::lanes::DeviceDescriptor,
+    },
+    Input {
+        worker_id: u64,
+        path_key: String,
+        device_id: String,
+        body: HardwareMessageBody,
+    },
+    Disconnected {
+        worker_id: u64,
+        path_key: String,
+        device_id: String,
+    },
+    Failed {
+        worker_id: u64,
         path_key: String,
         error: String,
     },
@@ -149,7 +179,7 @@ impl SaitekRemoteManager {
             .profile(HARDWARE_CLAIM_PROFILE_ID.to_string()),
         ));
         let (supervisor_event_tx, supervisor_event_rx) =
-            tokio_mpsc::unbounded_channel::<WorkerEvent>();
+            tokio_mpsc::unbounded_channel::<WorkerReport>();
         let (manager_event_tx, manager_event_rx) = tokio_mpsc::unbounded_channel::<WorkerEvent>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let supervisor = Supervisor::new(
@@ -385,42 +415,38 @@ async fn routing_reconciliation_loop(
     }
 }
 
-async fn reconcile_routing_current_state(
+async fn reconcile_routing_current_state<C, T>(
     shared: Arc<Mutex<ManagerState>>,
-    claim_manager: Arc<Mutex<HardwareClaimManager>>,
+    claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
     reason: &'static str,
-) -> Result<()> {
-    let (manager_endpoint, known_devices) = {
+) -> Result<()>
+where
+    C: StateStore,
+    T: StateStore,
+{
+    let (manager_id, manager_endpoint, current_devices) = {
         let state = shared.lock().await;
         (
+            state.manager_id.clone(),
             state.endpoint.clone(),
-            state.devices.keys().cloned().collect::<BTreeSet<_>>(),
+            state.devices.clone(),
         )
     };
     let manager_endpoint = EndpointAddress::parse(&manager_endpoint)?;
+    let known_devices = current_devices.keys().cloned().collect::<BTreeSet<_>>();
 
     let managed_contracts = {
         let mut claim_manager = claim_manager.lock().await;
         claim_manager
             .reconcile(
                 |contract, record| -> deckr::Result<bool> {
-                    if !contract.participants.contains(&manager_endpoint) {
-                        return Ok(false);
-                    }
-                    let Some(terms_value) = record.terms.clone() else {
-                        return Ok(false);
-                    };
-                    let terms = match HardwareClaimTerms::from_value(terms_value) {
-                        Ok(terms) => terms,
-                        Err(error) => {
-                            warn!(
-                                "Ignoring invalid Saitek hardware claim contract {}: {error}",
-                                contract.key
-                            );
-                            return Ok(false);
-                        }
-                    };
-                    Ok(terms.manager_endpoint == manager_endpoint)
+                    accept_current_hardware_claim(
+                        contract,
+                        record,
+                        &manager_endpoint,
+                        &manager_id,
+                        &current_devices,
+                    )
                 },
                 None,
             )
@@ -451,6 +477,62 @@ async fn reconcile_routing_current_state(
         let _ = sender.send(RuntimeCommand::ResetDevice);
     }
     Ok(())
+}
+
+fn accept_current_hardware_claim(
+    contract: &ContractHandle,
+    record: &ContractRecord,
+    manager_endpoint: &EndpointAddress,
+    manager_id: &str,
+    current_devices: &BTreeMap<String, deckr::lanes::DeviceDescriptor>,
+) -> deckr::Result<bool> {
+    if !contract.participants.contains(manager_endpoint) {
+        return Ok(false);
+    }
+    let Some(terms_value) = record.terms.clone() else {
+        return Ok(false);
+    };
+    let terms = match HardwareClaimTerms::from_value(terms_value) {
+        Ok(terms) => terms,
+        Err(error) => {
+            warn!(
+                "Ignoring invalid Saitek hardware claim contract {}: {error}",
+                contract.key
+            );
+            return Ok(false);
+        }
+    };
+    if &terms.manager_endpoint != manager_endpoint {
+        return Ok(false);
+    }
+    if terms.manager_endpoint.endpoint_id() != manager_id {
+        return Ok(false);
+    }
+    for device in &terms.devices {
+        let device_ref = &device.device_ref;
+        if device_ref.manager_id != manager_id {
+            return Ok(false);
+        }
+        let Some(current) = current_devices.get(&device_ref.device_id) else {
+            debug!(
+                "Rejecting Saitek hardware claim contract {} for absent device {}",
+                contract.key, device_ref.device_id
+            );
+            return Ok(false);
+        };
+        if device_ref
+            .fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| fingerprint != &current.fingerprint)
+        {
+            debug!(
+                "Rejecting Saitek hardware claim contract {} for fingerprint mismatch on device {}",
+                contract.key, device_ref.device_id
+            );
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn worker_event_loop(
@@ -521,6 +603,7 @@ async fn worker_event_loop(
                 device_id,
             } => {
                 debug!("Saitek device disconnected path={path_key} device={device_id}");
+                let managed_contracts = { claim_manager.lock().await.managed_contracts() };
                 {
                     let mut state = shared.lock().await;
                     state.devices.remove(&device_id);
@@ -528,8 +611,13 @@ async fn worker_event_loop(
                     state.routing.remove_device(&device_id);
                 }
                 publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
-                cancel_disconnected_device_claims(claim_manager.clone(), &device_id, "Saitek")
-                    .await?;
+                cancel_managed_device_claims(
+                    claim_manager.clone(),
+                    managed_contracts,
+                    &device_id,
+                    "Saitek",
+                )
+                .await?;
                 reconcile_routing_current_state(
                     shared.clone(),
                     claim_manager.clone(),
@@ -545,8 +633,9 @@ async fn worker_event_loop(
     bail!("device worker event stream closed")
 }
 
-async fn cancel_disconnected_device_claims<C, T>(
+async fn cancel_managed_device_claims<C, T>(
     claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
+    managed_contracts: Vec<ConcordManagedContract>,
     device_id: &str,
     log_label: &'static str,
 ) -> Result<()>
@@ -554,7 +643,6 @@ where
     C: StateStore,
     T: StateStore,
 {
-    let managed_contracts = { claim_manager.lock().await.managed_contracts() };
     for managed in managed_contracts {
         if !managed_claims_device(&managed, device_id) {
             continue;
@@ -757,17 +845,33 @@ fn ensure_empty_params(
 struct Supervisor {
     manager_id: String,
     backend: Arc<dyn Backend>,
-    worker_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
-    worker_rx: tokio_mpsc::UnboundedReceiver<WorkerEvent>,
+    worker_tx: tokio_mpsc::UnboundedSender<WorkerReport>,
+    worker_rx: tokio_mpsc::UnboundedReceiver<WorkerReport>,
     manager_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
+    next_worker_id: u64,
+    launched_workers: HashMap<String, LaunchedWorker>,
+    active_workers: HashMap<String, ActiveWorker>,
+}
+
+#[derive(Debug, Clone)]
+struct LaunchedWorker {
+    worker_id: u64,
+    command_tx: Sender<RuntimeCommand>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveWorker {
+    worker_id: u64,
+    device_id: String,
+    command_tx: Sender<RuntimeCommand>,
 }
 
 impl Supervisor {
     fn new(
         manager_id: String,
         backend: Arc<dyn Backend>,
-        worker_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
-        worker_rx: tokio_mpsc::UnboundedReceiver<WorkerEvent>,
+        worker_tx: tokio_mpsc::UnboundedSender<WorkerReport>,
+        worker_rx: tokio_mpsc::UnboundedReceiver<WorkerReport>,
         manager_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
     ) -> Self {
         Self {
@@ -776,14 +880,14 @@ impl Supervisor {
             worker_tx,
             worker_rx,
             manager_tx,
+            next_worker_id: 0,
+            launched_workers: HashMap::new(),
+            active_workers: HashMap::new(),
         }
     }
 
     async fn run(mut self, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
         let mut discovery = time::interval(DISCOVERY_INTERVAL);
-        let mut active_paths = HashSet::<String>::new();
-        let mut launched_paths = HashSet::<String>::new();
-        let mut worker_senders = Vec::<Sender<RuntimeCommand>>::new();
 
         loop {
             tokio::select! {
@@ -792,47 +896,194 @@ impl Supervisor {
                 }
                 _ = discovery.tick() => {
                     let descriptors = enumerate_canonical(self.backend.clone()).await?;
-                    for descriptor in descriptors {
-                        let path_key = descriptor.path_key();
-                        if active_paths.contains(&path_key) || launched_paths.contains(&path_key) {
-                            continue;
-                        }
-                        launched_paths.insert(path_key.clone());
-                        let (command_tx, command_rx) = mpsc::channel::<RuntimeCommand>();
-                        worker_senders.push(command_tx.clone());
-                        spawn_device_worker(
-                            self.manager_id.clone(),
-                            self.backend.clone(),
-                            descriptor,
-                            self.worker_tx.clone(),
-                            command_tx,
-                            command_rx,
-                        );
-                    }
+                    self.reconcile_usb_presence(descriptors);
                 }
                 maybe_event = self.worker_rx.recv() => {
                     let Some(event) = maybe_event else { continue; };
-                    match &event {
-                        WorkerEvent::Connected { path_key, .. } => {
-                            launched_paths.remove(path_key.as_str());
-                            active_paths.insert(path_key.clone());
-                        }
-                        WorkerEvent::Disconnected { path_key, .. }
-                        | WorkerEvent::Failed { path_key, .. } => {
-                            launched_paths.remove(path_key.as_str());
-                            active_paths.remove(path_key.as_str());
-                        }
-                        WorkerEvent::Input { .. } => {}
-                    }
-                    let _ = self.manager_tx.send(event);
+                    self.handle_worker_report(event);
                 }
             }
         }
 
-        for sender in worker_senders {
-            let _ = sender.send(RuntimeCommand::Stop);
-        }
+        self.stop_all_workers();
         Ok(())
+    }
+
+    fn reconcile_usb_presence(&mut self, descriptors: Vec<DeviceCandidate>) {
+        let present_paths = descriptors
+            .iter()
+            .map(DeviceCandidate::path_key)
+            .collect::<HashSet<_>>();
+
+        let removed_active_paths = self
+            .active_workers
+            .keys()
+            .filter(|path_key| !present_paths.contains(*path_key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path_key in removed_active_paths {
+            let Some(active) = self.active_workers.remove(&path_key) else {
+                continue;
+            };
+            let _ = active.command_tx.send(RuntimeCommand::Stop);
+            let _ = self.manager_tx.send(WorkerEvent::Disconnected {
+                path_key,
+                device_id: active.device_id,
+            });
+        }
+
+        let removed_launched_paths = self
+            .launched_workers
+            .keys()
+            .filter(|path_key| !present_paths.contains(*path_key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path_key in removed_launched_paths {
+            if let Some(launched) = self.launched_workers.remove(&path_key) {
+                let _ = launched.command_tx.send(RuntimeCommand::Stop);
+            }
+        }
+
+        for descriptor in descriptors {
+            let path_key = descriptor.path_key();
+            if self.active_workers.contains_key(&path_key)
+                || self.launched_workers.contains_key(&path_key)
+            {
+                continue;
+            }
+            self.next_worker_id += 1;
+            let worker_id = self.next_worker_id;
+            let (command_tx, command_rx) = mpsc::channel::<RuntimeCommand>();
+            self.launched_workers.insert(
+                path_key,
+                LaunchedWorker {
+                    worker_id,
+                    command_tx: command_tx.clone(),
+                },
+            );
+            spawn_device_worker(
+                worker_id,
+                self.manager_id.clone(),
+                self.backend.clone(),
+                descriptor,
+                self.worker_tx.clone(),
+                command_tx,
+                command_rx,
+            );
+        }
+    }
+
+    fn handle_worker_report(&mut self, report: WorkerReport) {
+        match report {
+            WorkerReport::Connected {
+                worker_id,
+                path_key,
+                device_id,
+                command_tx,
+                device,
+            } => {
+                let Some(launched) = self.launched_workers.get(&path_key) else {
+                    let _ = command_tx.send(RuntimeCommand::Stop);
+                    return;
+                };
+                if launched.worker_id != worker_id {
+                    let _ = command_tx.send(RuntimeCommand::Stop);
+                    return;
+                }
+                let launched = self.launched_workers.remove(&path_key).expect("checked");
+                self.active_workers.insert(
+                    path_key.clone(),
+                    ActiveWorker {
+                        worker_id,
+                        device_id: device_id.clone(),
+                        command_tx: launched.command_tx,
+                    },
+                );
+                let _ = self.manager_tx.send(WorkerEvent::Connected {
+                    path_key,
+                    device_id,
+                    command_tx,
+                    device,
+                });
+            }
+            WorkerReport::Input {
+                worker_id,
+                path_key,
+                device_id,
+                body,
+            } => {
+                let Some(active) = self.active_workers.get(&path_key) else {
+                    return;
+                };
+                if active.worker_id != worker_id || active.device_id != device_id {
+                    return;
+                }
+                let _ = self.manager_tx.send(WorkerEvent::Input { device_id, body });
+            }
+            WorkerReport::Disconnected {
+                worker_id,
+                path_key,
+                device_id,
+            } => {
+                if let Some(active) = self.active_workers.get(&path_key) {
+                    if active.worker_id == worker_id && active.device_id == device_id {
+                        self.active_workers.remove(&path_key);
+                        let _ = self.manager_tx.send(WorkerEvent::Disconnected {
+                            path_key,
+                            device_id,
+                        });
+                    }
+                    return;
+                }
+                if self
+                    .launched_workers
+                    .get(&path_key)
+                    .is_some_and(|launched| launched.worker_id == worker_id)
+                {
+                    self.launched_workers.remove(&path_key);
+                }
+            }
+            WorkerReport::Failed {
+                worker_id,
+                path_key,
+                error,
+            } => {
+                if let Some(active) = self.active_workers.get(&path_key) {
+                    if active.worker_id == worker_id {
+                        let active = self.active_workers.remove(&path_key).expect("checked");
+                        let _ = self.manager_tx.send(WorkerEvent::Disconnected {
+                            path_key: path_key.clone(),
+                            device_id: active.device_id,
+                        });
+                        let _ = self
+                            .manager_tx
+                            .send(WorkerEvent::Failed { path_key, error });
+                    }
+                    return;
+                }
+                if self
+                    .launched_workers
+                    .get(&path_key)
+                    .is_some_and(|launched| launched.worker_id == worker_id)
+                {
+                    self.launched_workers.remove(&path_key);
+                    let _ = self
+                        .manager_tx
+                        .send(WorkerEvent::Failed { path_key, error });
+                }
+            }
+        }
+    }
+
+    fn stop_all_workers(&mut self) {
+        for launched in self.launched_workers.values() {
+            let _ = launched.command_tx.send(RuntimeCommand::Stop);
+        }
+        for active in self.active_workers.values() {
+            let _ = active.command_tx.send(RuntimeCommand::Stop);
+        }
+        self.launched_workers.clear();
+        self.active_workers.clear();
     }
 }
 
@@ -847,10 +1098,11 @@ async fn enumerate_canonical(backend: Arc<dyn Backend>) -> Result<Vec<DeviceCand
 }
 
 fn spawn_device_worker(
+    worker_id: u64,
     manager_id: String,
     backend: Arc<dyn Backend>,
     descriptor: DeviceCandidate,
-    worker_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
+    worker_tx: tokio_mpsc::UnboundedSender<WorkerReport>,
     command_tx: Sender<RuntimeCommand>,
     command_rx: mpsc::Receiver<RuntimeCommand>,
 ) {
@@ -858,13 +1110,15 @@ fn spawn_device_worker(
     thread::spawn(move || {
         if let Err(error) = device_worker(
             backend,
+            worker_id,
             manager_id,
             descriptor,
             worker_tx.clone(),
             command_tx,
             command_rx,
         ) {
-            let _ = worker_tx.send(WorkerEvent::Failed {
+            let _ = worker_tx.send(WorkerReport::Failed {
+                worker_id,
                 path_key,
                 error: format!("{error:#}"),
             });
@@ -874,9 +1128,10 @@ fn spawn_device_worker(
 
 fn device_worker(
     backend: Arc<dyn Backend>,
+    worker_id: u64,
     manager_id: String,
     descriptor: DeviceCandidate,
-    worker_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
+    worker_tx: tokio_mpsc::UnboundedSender<WorkerReport>,
     command_tx: Sender<RuntimeCommand>,
     command_rx: mpsc::Receiver<RuntimeCommand>,
 ) -> Result<()> {
@@ -896,7 +1151,8 @@ fn device_worker(
     );
 
     worker_tx
-        .send(WorkerEvent::Connected {
+        .send(WorkerReport::Connected {
+            worker_id,
             path_key: path_key.clone(),
             device_id: local_device_id.clone(),
             command_tx: command_tx.clone(),
@@ -912,7 +1168,8 @@ fn device_worker(
                 return Ok(());
             }
             if let Err(error) = apply_runtime_command(&mut *handle, command) {
-                let _ = worker_tx.send(WorkerEvent::Disconnected {
+                let _ = worker_tx.send(WorkerReport::Disconnected {
+                    worker_id,
                     path_key: path_key.clone(),
                     device_id: local_device_id.clone(),
                 });
@@ -927,7 +1184,8 @@ fn device_worker(
             }
             Ok(command) => {
                 if let Err(error) = apply_runtime_command(&mut *handle, command) {
-                    let _ = worker_tx.send(WorkerEvent::Disconnected {
+                    let _ = worker_tx.send(WorkerReport::Disconnected {
+                        worker_id,
                         path_key: path_key.clone(),
                         device_id: local_device_id.clone(),
                     });
@@ -956,7 +1214,9 @@ fn device_worker(
             if let Some(body) =
                 translate_hid_event(event, &manager_id, &local_device_id, &fingerprint)
             {
-                let _ = worker_tx.send(WorkerEvent::Input {
+                let _ = worker_tx.send(WorkerReport::Input {
+                    worker_id,
+                    path_key: path_key.clone(),
                     device_id: local_device_id.clone(),
                     body,
                 });
@@ -1165,35 +1425,49 @@ mod tests {
         png.into_inner()
     }
 
-    fn hardware_claim_terms(manager_id: &str, device_id: &str) -> serde_json::Value {
+    fn hardware_claim_terms_with_fingerprint(
+        manager_id: &str,
+        device_id: &str,
+        fingerprint: Option<&str>,
+    ) -> serde_json::Value {
+        let mut device_ref = serde_json::json!({
+            "managerId": manager_id,
+            "deviceId": device_id,
+        });
+        if let Some(fingerprint) = fingerprint {
+            device_ref
+                .as_object_mut()
+                .unwrap()
+                .insert("fingerprint".to_string(), fingerprint.into());
+        }
         serde_json::json!({
             "profile": HARDWARE_CLAIM_PROFILE_ID,
             "claimId": "claim-1",
             "controllerEndpoint": "controller:main",
             "managerEndpoint": hardware_manager_address(manager_id),
             "devices": [{
-                "deviceRef": {"managerId": manager_id, "deviceId": device_id},
+                "deviceRef": device_ref,
                 "instanceCount": 1
             }]
         })
     }
 
-    async fn claimed_route(
+    async fn claim_context(
         manager_id: &str,
         device_id: &str,
+        fingerprint: Option<&str>,
     ) -> (
         ConcordCoordinator<MemoryStateStore, MemoryStateStore>,
         ContractHandle,
         EndpointAddress,
         ConcordParticipantManager<MemoryStateStore, MemoryStateStore>,
-        HardwareClaimRouting,
     ) {
         let contracts = MemoryStateStore::new();
         let tokens = MemoryStateStore::new();
         let concord = ConcordCoordinator::new(contracts, tokens);
         let controller = EndpointAddress::parse("controller:main").unwrap();
         let manager = EndpointAddress::parse(hardware_manager_address(manager_id)).unwrap();
-        let mut lifecycle = ConcordParticipantManager::new(
+        let lifecycle = ConcordParticipantManager::new(
             concord.clone(),
             manager.clone(),
             "manager-session".into(),
@@ -1206,7 +1480,11 @@ mod tests {
                 Some("contract-1".to_string()),
                 1,
                 Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
-                Some(hardware_claim_terms(manager_id, device_id)),
+                Some(hardware_claim_terms_with_fingerprint(
+                    manager_id,
+                    device_id,
+                    fingerprint,
+                )),
                 Some(controller.clone()),
             )
             .await
@@ -1221,6 +1499,21 @@ mod tests {
             .await
             .unwrap();
 
+        (concord, contract, manager, lifecycle)
+    }
+
+    async fn claimed_route(
+        manager_id: &str,
+        device_id: &str,
+    ) -> (
+        ConcordCoordinator<MemoryStateStore, MemoryStateStore>,
+        ContractHandle,
+        EndpointAddress,
+        ConcordParticipantManager<MemoryStateStore, MemoryStateStore>,
+        HardwareClaimRouting,
+    ) {
+        let (concord, contract, manager, mut lifecycle) =
+            claim_context(manager_id, device_id, None).await;
         let managed = lifecycle
             .reconcile(|_, _| -> deckr::Result<bool> { Ok(true) }, None)
             .await
@@ -1237,6 +1530,165 @@ mod tests {
         );
 
         (concord, contract, manager, lifecycle, routing)
+    }
+
+    fn supervisor_for_tests() -> (Supervisor, tokio_mpsc::UnboundedReceiver<WorkerEvent>) {
+        let (worker_tx, worker_rx) = tokio_mpsc::unbounded_channel::<WorkerReport>();
+        let (manager_tx, manager_rx) = tokio_mpsc::unbounded_channel::<WorkerEvent>();
+        (
+            Supervisor::new(
+                "saitek-main".to_string(),
+                Arc::new(FakeBackend::new()),
+                worker_tx,
+                worker_rx,
+                manager_tx,
+            ),
+            manager_rx,
+        )
+    }
+
+    fn assert_next_disconnected(
+        manager_rx: &mut tokio_mpsc::UnboundedReceiver<WorkerEvent>,
+        expected_path: &str,
+        expected_device: &str,
+    ) {
+        match manager_rx.try_recv().unwrap() {
+            WorkerEvent::Disconnected {
+                path_key,
+                device_id,
+            } => {
+                assert_eq!(path_key, expected_path);
+                assert_eq!(device_id, expected_device);
+            }
+            other => panic!("expected disconnected event, got {other:?}"),
+        }
+    }
+
+    async fn shared_state_with_device(
+        device_id: &str,
+        fingerprint: &str,
+    ) -> Arc<Mutex<ManagerState>> {
+        let shared = Arc::new(Mutex::new(ManagerState::new(
+            "saitek-main".to_string(),
+            "manager-session".to_string(),
+        )));
+        {
+            let mut state = shared.lock().await;
+            state.devices.insert(
+                device_id.to_string(),
+                device_descriptor(&sample_candidate(), device_id, fingerprint),
+            );
+        }
+        shared
+    }
+
+    #[test]
+    fn supervisor_disconnects_active_worker_when_path_disappears() {
+        let (mut supervisor, mut manager_rx) = supervisor_for_tests();
+        let path_key = sample_candidate().path_key();
+        let device_id = sample_candidate().hardware_id();
+        let (command_tx, command_rx) = mpsc::channel::<RuntimeCommand>();
+        supervisor.active_workers.insert(
+            path_key.clone(),
+            ActiveWorker {
+                worker_id: 1,
+                device_id: device_id.clone(),
+                command_tx,
+            },
+        );
+
+        supervisor.reconcile_usb_presence(vec![]);
+
+        assert!(matches!(
+            command_rx.try_recv().unwrap(),
+            RuntimeCommand::Stop
+        ));
+        assert_next_disconnected(&mut manager_rx, &path_key, &device_id);
+        assert!(supervisor.active_workers.is_empty());
+        assert!(manager_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn supervisor_disconnects_active_worker_before_forwarding_failure() {
+        let (mut supervisor, mut manager_rx) = supervisor_for_tests();
+        let path_key = sample_candidate().path_key();
+        let device_id = sample_candidate().hardware_id();
+        let (command_tx, _command_rx) = mpsc::channel::<RuntimeCommand>();
+        supervisor.active_workers.insert(
+            path_key.clone(),
+            ActiveWorker {
+                worker_id: 7,
+                device_id: device_id.clone(),
+                command_tx,
+            },
+        );
+
+        supervisor.handle_worker_report(WorkerReport::Failed {
+            worker_id: 7,
+            path_key: path_key.clone(),
+            error: "read failed".to_string(),
+        });
+
+        assert_next_disconnected(&mut manager_rx, &path_key, &device_id);
+        match manager_rx.try_recv().unwrap() {
+            WorkerEvent::Failed {
+                path_key: failed_path,
+                error,
+            } => {
+                assert_eq!(failed_path, path_key);
+                assert_eq!(error, "read failed");
+            }
+            other => panic!("expected failed event, got {other:?}"),
+        }
+        assert!(supervisor.active_workers.is_empty());
+    }
+
+    #[test]
+    fn supervisor_ignores_stale_worker_events_after_reconnect_same_device() {
+        let (mut supervisor, mut manager_rx) = supervisor_for_tests();
+        let path_key = sample_candidate().path_key();
+        let device_id = sample_candidate().hardware_id();
+        let (old_command_tx, old_command_rx) = mpsc::channel::<RuntimeCommand>();
+        supervisor.active_workers.insert(
+            path_key.clone(),
+            ActiveWorker {
+                worker_id: 1,
+                device_id: device_id.clone(),
+                command_tx: old_command_tx,
+            },
+        );
+        supervisor.reconcile_usb_presence(vec![]);
+        assert!(matches!(
+            old_command_rx.try_recv().unwrap(),
+            RuntimeCommand::Stop
+        ));
+        assert_next_disconnected(&mut manager_rx, &path_key, &device_id);
+
+        let (new_command_tx, _new_command_rx) = mpsc::channel::<RuntimeCommand>();
+        supervisor.active_workers.insert(
+            path_key.clone(),
+            ActiveWorker {
+                worker_id: 2,
+                device_id: device_id.clone(),
+                command_tx: new_command_tx,
+            },
+        );
+
+        supervisor.handle_worker_report(WorkerReport::Disconnected {
+            worker_id: 1,
+            path_key: path_key.clone(),
+            device_id: device_id.clone(),
+        });
+        supervisor.handle_worker_report(WorkerReport::Failed {
+            worker_id: 1,
+            path_key: path_key.clone(),
+            error: "late failure".to_string(),
+        });
+
+        assert!(manager_rx.try_recv().is_err());
+        let active = supervisor.active_workers.get(&path_key).unwrap();
+        assert_eq!(active.worker_id, 2);
+        assert_eq!(active.device_id, device_id);
     }
 
     #[test]
@@ -1309,7 +1761,8 @@ mod tests {
             claimed_route("saitek-main", "fip").await;
 
         let claim_manager = Arc::new(Mutex::new(lifecycle));
-        cancel_disconnected_device_claims(claim_manager.clone(), "fip", "Saitek")
+        let managed_contracts = { claim_manager.lock().await.managed_contracts() };
+        cancel_managed_device_claims(claim_manager.clone(), managed_contracts, "fip", "Saitek")
             .await
             .unwrap();
 
@@ -1335,6 +1788,104 @@ mod tests {
         assert!(routing.claim_recipient("fip").is_none());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].key, advertisement.key);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_device_claim_is_accepted_and_attaches_manager_token() {
+        let (concord, contract, manager_endpoint, lifecycle) =
+            claim_context("saitek-main", "fip", Some("fingerprint:fip")).await;
+        let claim_manager = Arc::new(Mutex::new(lifecycle));
+        let shared = shared_state_with_device("fip", "fingerprint:fip").await;
+
+        reconcile_routing_current_state(shared.clone(), claim_manager.clone(), "test")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            concord.validate(&contract, None).await.status,
+            ContractValidityStatus::Valid
+        );
+        assert!(concord
+            .participant_token(&contract, &manager_endpoint)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(shared.lock().await.routing.claim_recipient("fip").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_device_claim_is_rejected_before_manager_token_attachment() {
+        let (concord, contract, manager_endpoint, lifecycle) =
+            claim_context("saitek-main", "missing-fip", None).await;
+        let claim_manager = Arc::new(Mutex::new(lifecycle));
+        let shared = shared_state_with_device("fip", "fingerprint:fip").await;
+
+        reconcile_routing_current_state(shared.clone(), claim_manager.clone(), "test")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            concord.validate(&contract, None).await.status,
+            ContractValidityStatus::NotYetFulfilled
+        );
+        assert!(concord
+            .participant_token(&contract, &manager_endpoint)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(claim_manager.lock().await.managed_contracts().is_empty());
+        assert!(shared
+            .lock()
+            .await
+            .routing
+            .claim_recipient("missing-fip")
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fingerprint_mismatch_claim_is_rejected_before_manager_token_attachment() {
+        let (concord, contract, manager_endpoint, lifecycle) =
+            claim_context("saitek-main", "fip", Some("fingerprint:other")).await;
+        let claim_manager = Arc::new(Mutex::new(lifecycle));
+        let shared = shared_state_with_device("fip", "fingerprint:fip").await;
+
+        reconcile_routing_current_state(shared, claim_manager.clone(), "test")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            concord.validate(&contract, None).await.status,
+            ContractValidityStatus::NotYetFulfilled
+        );
+        assert!(concord
+            .participant_token(&contract, &manager_endpoint)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(claim_manager.lock().await.managed_contracts().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn omitted_fingerprint_claim_is_accepted_for_present_device() {
+        let (concord, contract, manager_endpoint, lifecycle) =
+            claim_context("saitek-main", "fip", None).await;
+        let claim_manager = Arc::new(Mutex::new(lifecycle));
+        let shared = shared_state_with_device("fip", "fingerprint:fip").await;
+
+        reconcile_routing_current_state(shared.clone(), claim_manager, "test")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            concord.validate(&contract, None).await.status,
+            ContractValidityStatus::Valid
+        );
+        assert!(concord
+            .participant_token(&contract, &manager_endpoint)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(shared.lock().await.routing.claim_recipient("fip").is_some());
     }
 
     #[test]
