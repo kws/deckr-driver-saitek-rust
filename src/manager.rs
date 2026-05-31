@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use deckr::beacon::{AdvertisementHandle, BeaconAdvertiser};
-use deckr::concord::{ConcordCoordinator, ConcordParticipantManager};
+use deckr::concord::{ConcordCoordinator, ConcordManagedContract, ConcordParticipantManager};
 use deckr::endpoint::{hardware_manager_address, EndpointAddress};
 use deckr::hardware::{hardware_beacon_payload, HardwareClaimRouting};
 use deckr::lanes::{
@@ -18,7 +18,7 @@ use deckr::nats::{NatsDeckrRuntime, NatsStateStore};
 use deckr::profiles::hardware::{
     HardwareBeaconPayload, HardwareClaimTerms, HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID,
 };
-use deckr::state::DEFAULT_STATE_RENEWAL_INTERVAL_SECONDS;
+use deckr::state::{StateStore, DEFAULT_STATE_RENEWAL_INTERVAL_SECONDS};
 use futures_util::StreamExt;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
@@ -168,6 +168,7 @@ impl SaitekRemoteManager {
             runtime.clone(),
             shared.clone(),
             manager_event_rx,
+            claim_manager.clone(),
         ));
         tasks.spawn(inbound_command_loop(runtime.clone(), shared.clone()));
         tasks.spawn(hardware_advertisement_loop(runtime.clone(), shared.clone()));
@@ -456,6 +457,7 @@ async fn worker_event_loop(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
     mut worker_rx: tokio_mpsc::UnboundedReceiver<WorkerEvent>,
+    claim_manager: Arc<Mutex<HardwareClaimManager>>,
 ) -> Result<()> {
     while let Some(event) = worker_rx.recv().await {
         match event {
@@ -524,6 +526,8 @@ async fn worker_event_loop(
                 device_id,
             } => {
                 debug!("Saitek device disconnected path={path_key} device={device_id}");
+                cancel_disconnected_device_claims(claim_manager.clone(), &device_id, "Saitek")
+                    .await?;
                 let (manager_id, session_id) = {
                     let mut state = shared.lock().await;
                     let manager_id = state.manager_id.clone();
@@ -533,6 +537,12 @@ async fn worker_event_loop(
                     state.routing.remove_device(&device_id);
                     (manager_id, session_id)
                 };
+                reconcile_routing_current_state(
+                    shared.clone(),
+                    claim_manager.clone(),
+                    "device disconnected",
+                )
+                .await?;
                 publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
                 let message = DeckrMessage::hardware_input(
                     &manager_id,
@@ -555,6 +565,59 @@ async fn worker_event_loop(
         }
     }
     bail!("device worker event stream closed")
+}
+
+async fn cancel_disconnected_device_claims<C, T>(
+    claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
+    device_id: &str,
+    log_label: &'static str,
+) -> Result<()>
+where
+    C: StateStore,
+    T: StateStore,
+{
+    let managed_contracts = { claim_manager.lock().await.managed_contracts() };
+    for managed in managed_contracts {
+        if !managed_claims_device(&managed, device_id) {
+            continue;
+        }
+        let contract_key = managed.contract.key.clone();
+        let cancel_result = {
+            let manager = claim_manager.lock().await;
+            manager
+                .cancel(
+                    &managed.contract,
+                    Some(format!("hardware device {device_id} disconnected")),
+                )
+                .await
+        };
+        match cancel_result {
+            Ok(true) => {
+                claim_manager.lock().await.release(&contract_key);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    "Failed to cancel {log_label} hardware claim contract {} for disconnected device {device_id}: {error:#}",
+                    managed.contract.key
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn managed_claims_device(managed: &ConcordManagedContract, device_id: &str) -> bool {
+    let Some(terms_value) = managed.record.terms.clone() else {
+        return false;
+    };
+    let Ok(terms) = HardwareClaimTerms::from_value(terms_value) else {
+        return false;
+    };
+    terms
+        .devices
+        .iter()
+        .any(|device| device.device_ref.device_id == device_id)
 }
 
 async fn inbound_command_loop(
@@ -964,7 +1027,10 @@ mod tests {
 
     use super::*;
     use crate::protocol::{FipControlPacket, REQ_CLEAR_IMAGE, REQ_PROBE, REQ_SET_IMAGE};
+    use deckr::beacon::find_candidates;
+    use deckr::concord::{ContractHandle, ContractValidityStatus};
     use deckr::hardware::HardwareClaimRoute;
+    use deckr::state::MemoryStateStore;
 
     #[derive(Clone)]
     struct FakeBackend {
@@ -1120,6 +1186,80 @@ mod tests {
         png.into_inner()
     }
 
+    fn hardware_claim_terms(manager_id: &str, device_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "profile": HARDWARE_CLAIM_PROFILE_ID,
+            "claimId": "claim-1",
+            "controllerEndpoint": "controller:main",
+            "managerEndpoint": hardware_manager_address(manager_id),
+            "devices": [{
+                "deviceRef": {"managerId": manager_id, "deviceId": device_id},
+                "instanceCount": 1
+            }]
+        })
+    }
+
+    async fn claimed_route(
+        manager_id: &str,
+        device_id: &str,
+    ) -> (
+        ConcordCoordinator<MemoryStateStore, MemoryStateStore>,
+        ContractHandle,
+        EndpointAddress,
+        ConcordParticipantManager<MemoryStateStore, MemoryStateStore>,
+        HardwareClaimRouting,
+    ) {
+        let contracts = MemoryStateStore::new();
+        let tokens = MemoryStateStore::new();
+        let concord = ConcordCoordinator::new(contracts, tokens);
+        let controller = EndpointAddress::parse("controller:main").unwrap();
+        let manager = EndpointAddress::parse(hardware_manager_address(manager_id)).unwrap();
+        let mut lifecycle = ConcordParticipantManager::new(
+            concord.clone(),
+            manager.clone(),
+            "manager-session".into(),
+        )
+        .unwrap()
+        .profile(HARDWARE_CLAIM_PROFILE_ID.to_string());
+        let contract = concord
+            .create_contract(
+                vec![controller.clone(), manager.clone()],
+                Some("contract-1".to_string()),
+                1,
+                Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
+                Some(hardware_claim_terms(manager_id, device_id)),
+                Some(controller.clone()),
+            )
+            .await
+            .unwrap();
+        concord
+            .attach(
+                &contract,
+                &controller,
+                "controller-session",
+                Some("controller-token".into()),
+            )
+            .await
+            .unwrap();
+
+        let managed = lifecycle
+            .reconcile(|_, _| -> deckr::Result<bool> { Ok(true) }, None)
+            .await
+            .unwrap();
+        let mut routing = HardwareClaimRouting::default();
+        let reconcile =
+            routing.reconcile_claims(&managed, &manager, &BTreeSet::from([device_id.to_string()]));
+
+        assert!(reconcile.ignored_claims.is_empty());
+        assert!(routing.claim_recipient(device_id).is_some());
+        assert_eq!(
+            concord.validate(&contract, None).await.status,
+            ContractValidityStatus::Valid
+        );
+
+        (concord, contract, manager, lifecycle, routing)
+    }
+
     #[test]
     fn hardware_advertisement_payload_uses_deckr_profile_api() {
         let mut state = ManagerState::new("saitek-main".to_string(), "manager-session".to_string());
@@ -1134,6 +1274,88 @@ mod tests {
 
         assert_eq!(parsed.manager_id, "saitek-main");
         assert_eq!(parsed.devices["fip"].device_ref.manager_id, "saitek-main");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn beacon_withdrawal_does_not_release_claim_route() {
+        let beacon_state = MemoryStateStore::new();
+        let manager = EndpointAddress::parse("hardware_manager:saitek-main").unwrap();
+        let advertiser = BeaconAdvertiser::new(
+            beacon_state.clone(),
+            HARDWARE_FEATURE_ID,
+            manager.clone(),
+            "manager-session",
+        )
+        .advertisement_id("hardware-saitek-main-manager-session")
+        .payload(serde_json::json!({}));
+        let advertisement = advertiser.publish().await.unwrap();
+        let (concord, contract, manager, mut lifecycle, mut routing) =
+            claimed_route("saitek-main", "fip").await;
+
+        advertiser.withdraw(&advertisement).await.unwrap();
+
+        assert!(find_candidates(&beacon_state, HARDWARE_FEATURE_ID)
+            .await
+            .unwrap()
+            .is_empty());
+        let managed = lifecycle
+            .reconcile(|_, _| -> deckr::Result<bool> { Ok(true) }, None)
+            .await
+            .unwrap();
+        let reconcile =
+            routing.reconcile_claims(&managed, &manager, &BTreeSet::from(["fip".to_string()]));
+
+        assert!(reconcile.reset_devices.is_empty());
+        assert!(routing.claim_recipient("fip").is_some());
+        assert_eq!(
+            concord.validate(&contract, None).await.status,
+            ContractValidityStatus::Valid
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_device_cancels_claim_route_without_withdrawing_advertisement() {
+        let beacon_state = MemoryStateStore::new();
+        let manager = EndpointAddress::parse("hardware_manager:saitek-main").unwrap();
+        let advertiser = BeaconAdvertiser::new(
+            beacon_state.clone(),
+            HARDWARE_FEATURE_ID,
+            manager,
+            "manager-session",
+        )
+        .advertisement_id("hardware-saitek-main-manager-session")
+        .payload(serde_json::json!({}));
+        let advertisement = advertiser.publish().await.unwrap();
+        let (concord, contract, manager, lifecycle, mut routing) =
+            claimed_route("saitek-main", "fip").await;
+
+        let claim_manager = Arc::new(Mutex::new(lifecycle));
+        cancel_disconnected_device_claims(claim_manager.clone(), "fip", "Saitek")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            concord.validate(&contract, None).await.status,
+            ContractValidityStatus::Cancelled
+        );
+        let managed = {
+            let mut lifecycle = claim_manager.lock().await;
+            lifecycle
+                .reconcile(|_, _| -> deckr::Result<bool> { Ok(true) }, None)
+                .await
+                .unwrap()
+        };
+        let reconcile =
+            routing.reconcile_claims(&managed, &manager, &BTreeSet::from(["fip".to_string()]));
+        let candidates = find_candidates(&beacon_state, HARDWARE_FEATURE_ID)
+            .await
+            .unwrap();
+
+        assert!(managed.is_empty());
+        assert!(reconcile.reset_devices.contains("fip"));
+        assert!(routing.claim_recipient("fip").is_none());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].key, advertisement.key);
     }
 
     #[test]
