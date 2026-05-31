@@ -12,7 +12,7 @@ use deckr::concord::{ConcordCoordinator, ConcordManagedContract, ConcordParticip
 use deckr::endpoint::{hardware_manager_address, EndpointAddress};
 use deckr::hardware::{hardware_beacon_payload, HardwareClaimRouting};
 use deckr::lanes::{
-    DeckrMessage, DeviceRef, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
+    DeckrMessage, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
 };
 use deckr::nats::{NatsDeckrRuntime, NatsStateStore};
 use deckr::profiles::hardware::{
@@ -468,23 +468,18 @@ async fn worker_event_loop(
                 device,
             } => {
                 debug!("Saitek device connected path={path_key} device={device_id}");
-                let descriptor = device.clone();
-                let (manager_id, session_id) = {
+                {
                     let mut state = shared.lock().await;
-                    let manager_id = state.manager_id.clone();
-                    let session_id = state.session_id.clone();
                     state.devices.insert(device_id.clone(), device);
                     state.command_map.insert(device_id.clone(), command_tx);
-                    (manager_id, session_id)
-                };
+                }
                 publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
-                let message = DeckrMessage::hardware_input(
-                    &manager_id,
-                    &session_id,
-                    &device_id,
-                    HardwareMessageBody::DeviceAvailable { descriptor },
-                )?;
-                runtime.publish(&message).await?;
+                reconcile_routing_current_state(
+                    shared.clone(),
+                    claim_manager.clone(),
+                    "device connected",
+                )
+                .await?;
             }
             WorkerEvent::Input { device_id, body } => {
                 if !matches!(body, HardwareMessageBody::ControlInput { .. }) {
@@ -526,38 +521,21 @@ async fn worker_event_loop(
                 device_id,
             } => {
                 debug!("Saitek device disconnected path={path_key} device={device_id}");
-                cancel_disconnected_device_claims(claim_manager.clone(), &device_id, "Saitek")
-                    .await?;
-                let (manager_id, session_id) = {
+                {
                     let mut state = shared.lock().await;
-                    let manager_id = state.manager_id.clone();
-                    let session_id = state.session_id.clone();
                     state.devices.remove(&device_id);
                     state.command_map.remove(&device_id);
                     state.routing.remove_device(&device_id);
-                    (manager_id, session_id)
-                };
+                }
+                publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
+                cancel_disconnected_device_claims(claim_manager.clone(), &device_id, "Saitek")
+                    .await?;
                 reconcile_routing_current_state(
                     shared.clone(),
                     claim_manager.clone(),
                     "device disconnected",
                 )
                 .await?;
-                publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
-                let message = DeckrMessage::hardware_input(
-                    &manager_id,
-                    &session_id,
-                    &device_id,
-                    HardwareMessageBody::DeviceUnavailable {
-                        device_ref: DeviceRef {
-                            manager_id: manager_id.clone(),
-                            device_id: device_id.clone(),
-                            fingerprint: None,
-                        },
-                        reason: Some("disconnected".to_string()),
-                    },
-                )?;
-                runtime.publish(&message).await?;
             }
             WorkerEvent::Failed { path_key, error } => {
                 warn!("Device worker {path_key} failed: {error}");
@@ -1030,6 +1008,7 @@ mod tests {
     use deckr::beacon::find_candidates;
     use deckr::concord::{ContractHandle, ContractValidityStatus};
     use deckr::hardware::HardwareClaimRoute;
+    use deckr::lanes::DeviceRef;
     use deckr::state::MemoryStateStore;
 
     #[derive(Clone)]
