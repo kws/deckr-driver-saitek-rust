@@ -119,3 +119,21 @@ exists in `kws/deckr`, the workflow uses it; otherwise it uses Deckr's default
 branch. Set the repository variable `DECKR_REF` to force a specific Deckr branch,
 tag, or 40-character commit SHA. For private repository access, add a
 `DECKR_REPO_TOKEN` secret with read access to `kws/deckr`.
+
+## Release Flow
+
+Driver releases are made from a release commit that pins the workflow to the
+exact Deckr commit used for the build. This keeps the release reproducible even
+when the driver tag does not exist in the upstream `kws/deckr` repository.
+
+1. Choose the Deckr commit SHA to release against.
+2. Update `version` in `Cargo.toml` and `Cargo.lock`.
+3. Replace every workflow `DECKR_REF` expression with the chosen 40-character
+   Deckr SHA.
+4. Run formatting, clippy, and tests.
+5. Commit the change as `Release vX.Y.Z`.
+6. Tag that commit as `vX.Y.Z` and push the branch and tag.
+7. Wait for GitHub Actions to publish the GitHub Release artifacts.
+8. Restore every workflow `DECKR_REF` value to
+   `${{ vars.DECKR_REF || github.head_ref || github.ref_name }}`.
+9. Commit the restore as `Restore unpinned Deckr workflow ref` and push it.
