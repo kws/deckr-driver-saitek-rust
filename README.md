@@ -47,6 +47,7 @@ Environment variables:
 
 - `DECKR_MANAGER_ID` (optional; overrides the `saitek-rust-<hostname>` default)
 - `DECKR_NATS_URL`
+- `DECKR_CONCORD_TOKEN_REFRESH_SECONDS` (optional; defaults to `15`)
 - `DECKR_STATE_RECONCILE_SECONDS` (optional; defaults to `300`)
 
 ## Linux USB Access

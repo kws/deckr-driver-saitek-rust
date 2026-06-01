@@ -17,7 +17,9 @@ use deckr::hardware::{hardware_beacon_payload, HardwareClaimRouting};
 use deckr::lanes::{
     DeckrMessage, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
 };
-use deckr::nats::{NatsDeckrRuntime, NatsStateStore};
+use deckr::nats::{
+    ConcordStateChangeSource, ConcordStateChangeStream, NatsDeckrRuntime, NatsStateStore,
+};
 use deckr::profiles::hardware::{
     HardwareBeaconPayload, HardwareClaimTerms, HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID,
 };
@@ -42,8 +44,40 @@ const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const USB_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BACKOFF_SECS: u64 = 10;
 const WATCH_RETRY_SECONDS: u64 = 1;
+const WATCH_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(100);
 
 type HardwareClaimManager = ConcordParticipantManager<NatsStateStore, NatsStateStore>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutingReconcileMode {
+    Full,
+    ManagedOnly,
+}
+
+#[derive(Debug, Default)]
+struct ConcordChangeBatch {
+    saw_contract: bool,
+    saw_token: bool,
+}
+
+impl ConcordChangeBatch {
+    fn record(&mut self, source: ConcordStateChangeSource) {
+        match source {
+            ConcordStateChangeSource::Contracts => self.saw_contract = true,
+            ConcordStateChangeSource::Tokens => self.saw_token = true,
+        }
+    }
+
+    fn reconcile_mode(&self) -> (RoutingReconcileMode, &'static str) {
+        if self.saw_contract {
+            (RoutingReconcileMode::Full, "contract watch")
+        } else if self.saw_token {
+            (RoutingReconcileMode::ManagedOnly, "token watch")
+        } else {
+            (RoutingReconcileMode::ManagedOnly, "empty watch batch")
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
@@ -178,8 +212,9 @@ impl SaitekRemoteManager {
             self.manager_id, self.nats_url
         );
         info!(
-            "Saitek state maintenance intervals: beacon renewal={}s, routing reconciliation={}s",
+            "Saitek state maintenance intervals: beacon renewal={}s, Concord token refresh={}s, routing reconciliation={}s",
             self.state_policy.renewal_interval.as_secs(),
+            self.state_policy.concord_token_refresh_interval.as_secs(),
             self.state_policy.reconcile_interval.as_secs()
         );
 
@@ -196,7 +231,8 @@ impl SaitekRemoteManager {
                 EndpointAddress::parse(hardware_manager_address(&self.manager_id))?,
                 self.session_id.clone(),
             )?
-            .profile(HARDWARE_CLAIM_PROFILE_ID.to_string()),
+            .profile(HARDWARE_CLAIM_PROFILE_ID.to_string())
+            .token_refresh_interval(self.state_policy.concord_token_refresh_interval),
         ));
         let (supervisor_event_tx, supervisor_event_rx) =
             tokio_mpsc::unbounded_channel::<WorkerReport>();
@@ -230,6 +266,11 @@ impl SaitekRemoteManager {
             runtime.clone(),
             shared.clone(),
             claim_manager.clone(),
+        ));
+        tasks.spawn(concord_token_renewal_loop(
+            shared.clone(),
+            claim_manager.clone(),
+            self.state_policy.concord_token_refresh_interval,
         ));
         tasks.spawn(routing_reconciliation_loop(
             shared.clone(),
@@ -406,19 +447,86 @@ async fn concord_state_watch_loop(
     claim_manager: Arc<Mutex<HardwareClaimManager>>,
 ) -> Result<()> {
     loop {
-        match runtime.wait_for_concord_change().await {
-            Ok(source) => {
-                reconcile_routing_current_state(
-                    shared.clone(),
-                    claim_manager.clone(),
-                    source.reason(),
-                )
-                .await?
-            }
+        let mut stream = match runtime.watch_concord_changes().await {
+            Ok(stream) => stream,
             Err(error) => {
                 warn!("Saitek Concord state watch is unavailable; watch will retry: {error:#}");
                 time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
+                continue;
             }
+        };
+        loop {
+            match next_concord_change_batch(&mut stream).await {
+                Ok(batch) => {
+                    let (mode, reason) = batch.reconcile_mode();
+                    reconcile_routing_current_state(
+                        shared.clone(),
+                        claim_manager.clone(),
+                        reason,
+                        mode,
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    warn!("Saitek Concord state watch is unavailable; watch will retry: {error:#}");
+                    time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn next_concord_change_batch(
+    stream: &mut ConcordStateChangeStream,
+) -> Result<ConcordChangeBatch> {
+    let first = stream.next().await?;
+    debug!(
+        "Saitek Concord {} changed at {}",
+        first.source.reason(),
+        first.key
+    );
+    let mut batch = ConcordChangeBatch::default();
+    batch.record(first.source);
+    let debounce = time::sleep(WATCH_DEBOUNCE_INTERVAL);
+    tokio::pin!(debounce);
+
+    loop {
+        tokio::select! {
+            () = &mut debounce => return Ok(batch),
+            change = stream.next() => {
+                let change = change?;
+                debug!(
+                    "Saitek Concord {} changed at {}",
+                    change.source.reason(),
+                    change.key
+                );
+                batch.record(change.source);
+            }
+        }
+    }
+}
+
+async fn concord_token_renewal_loop<C, T>(
+    shared: Arc<Mutex<ManagerState>>,
+    claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
+    renewal_interval: Duration,
+) -> Result<()>
+where
+    C: StateStore,
+    T: StateStore,
+{
+    loop {
+        time::sleep(renewal_interval).await;
+        if let Err(error) = reconcile_routing_current_state(
+            shared.clone(),
+            claim_manager.clone(),
+            "token renewal",
+            RoutingReconcileMode::ManagedOnly,
+        )
+        .await
+        {
+            warn!("Saitek Concord token renewal is unavailable; renewal will retry: {error:#}");
         }
     }
 }
@@ -433,6 +541,7 @@ async fn routing_reconciliation_loop(
             shared.clone(),
             claim_manager.clone(),
             "broker snapshot",
+            RoutingReconcileMode::Full,
         )
         .await
         {
@@ -446,6 +555,7 @@ async fn reconcile_routing_current_state<C, T>(
     shared: Arc<Mutex<ManagerState>>,
     claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
     reason: &'static str,
+    mode: RoutingReconcileMode,
 ) -> Result<()>
 where
     C: StateStore,
@@ -464,20 +574,25 @@ where
 
     let managed_contracts = {
         let mut claim_manager = claim_manager.lock().await;
-        claim_manager
-            .reconcile(
-                |contract, record| -> deckr::Result<bool> {
-                    accept_current_hardware_claim(
-                        contract,
-                        record,
-                        &manager_endpoint,
-                        &manager_id,
-                        &current_devices,
+        match mode {
+            RoutingReconcileMode::Full => {
+                claim_manager
+                    .reconcile(
+                        |contract, record| -> deckr::Result<bool> {
+                            accept_current_hardware_claim(
+                                contract,
+                                record,
+                                &manager_endpoint,
+                                &manager_id,
+                                &current_devices,
+                            )
+                        },
+                        None,
                     )
-                },
-                None,
-            )
-            .await?
+                    .await?
+            }
+            RoutingReconcileMode::ManagedOnly => claim_manager.reconcile_managed(None).await?,
+        }
     };
 
     debug!("Reconciling Saitek routing current state via {reason}");
@@ -587,6 +702,7 @@ async fn worker_event_loop(
                     shared.clone(),
                     claim_manager.clone(),
                     "device connected",
+                    RoutingReconcileMode::Full,
                 )
                 .await?;
             }
@@ -649,6 +765,7 @@ async fn worker_event_loop(
                     shared.clone(),
                     claim_manager.clone(),
                     "device disconnected",
+                    RoutingReconcileMode::Full,
                 )
                 .await?;
             }
@@ -1824,9 +1941,14 @@ mod tests {
         let claim_manager = Arc::new(Mutex::new(lifecycle));
         let shared = shared_state_with_device("fip", "fingerprint:fip").await;
 
-        reconcile_routing_current_state(shared.clone(), claim_manager.clone(), "test")
-            .await
-            .unwrap();
+        reconcile_routing_current_state(
+            shared.clone(),
+            claim_manager.clone(),
+            "test",
+            RoutingReconcileMode::Full,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             concord.validate(&contract, None).await.status,
@@ -1841,15 +1963,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn token_only_reconcile_does_not_discover_new_claims() {
+        let (concord, _contract, manager_endpoint, lifecycle) =
+            claim_context("saitek-main", "fip", Some("fingerprint:fip")).await;
+        let claim_manager = Arc::new(Mutex::new(lifecycle));
+        let shared = shared_state_with_device("fip", "fingerprint:fip").await;
+
+        reconcile_routing_current_state(
+            shared.clone(),
+            claim_manager.clone(),
+            "test",
+            RoutingReconcileMode::Full,
+        )
+        .await
+        .unwrap();
+
+        let controller = EndpointAddress::parse("controller:main").unwrap();
+        let second_contract = concord
+            .create_contract(
+                vec![controller.clone(), manager_endpoint.clone()],
+                Some("contract-2".to_string()),
+                1,
+                Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
+                Some(hardware_claim_terms_with_fingerprint(
+                    "saitek-main",
+                    "fip",
+                    Some("fingerprint:fip"),
+                )),
+                Some(controller.clone()),
+            )
+            .await
+            .unwrap();
+        concord
+            .attach(
+                &second_contract,
+                &controller,
+                "controller-session",
+                Some("controller-token-2".into()),
+            )
+            .await
+            .unwrap();
+
+        reconcile_routing_current_state(
+            shared.clone(),
+            claim_manager.clone(),
+            "token watch",
+            RoutingReconcileMode::ManagedOnly,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(claim_manager.lock().await.managed_contracts().len(), 1);
+        assert!(concord
+            .participant_token(&second_contract, &manager_endpoint)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(shared.lock().await.routing.claim_recipient("fip").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_device_claim_is_rejected_before_manager_token_attachment() {
         let (concord, contract, manager_endpoint, lifecycle) =
             claim_context("saitek-main", "missing-fip", None).await;
         let claim_manager = Arc::new(Mutex::new(lifecycle));
         let shared = shared_state_with_device("fip", "fingerprint:fip").await;
 
-        reconcile_routing_current_state(shared.clone(), claim_manager.clone(), "test")
-            .await
-            .unwrap();
+        reconcile_routing_current_state(
+            shared.clone(),
+            claim_manager.clone(),
+            "test",
+            RoutingReconcileMode::Full,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             concord.validate(&contract, None).await.status,
@@ -1876,9 +2063,14 @@ mod tests {
         let claim_manager = Arc::new(Mutex::new(lifecycle));
         let shared = shared_state_with_device("fip", "fingerprint:fip").await;
 
-        reconcile_routing_current_state(shared, claim_manager.clone(), "test")
-            .await
-            .unwrap();
+        reconcile_routing_current_state(
+            shared,
+            claim_manager.clone(),
+            "test",
+            RoutingReconcileMode::Full,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             concord.validate(&contract, None).await.status,
@@ -1899,9 +2091,14 @@ mod tests {
         let claim_manager = Arc::new(Mutex::new(lifecycle));
         let shared = shared_state_with_device("fip", "fingerprint:fip").await;
 
-        reconcile_routing_current_state(shared.clone(), claim_manager, "test")
-            .await
-            .unwrap();
+        reconcile_routing_current_state(
+            shared.clone(),
+            claim_manager,
+            "test",
+            RoutingReconcileMode::Full,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             concord.validate(&contract, None).await.status,
