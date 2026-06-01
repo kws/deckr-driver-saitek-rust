@@ -1,6 +1,6 @@
 [package]
 name = "deckr-saitek-manager"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Standalone Rust Saitek Flight Instrument Panel manager for Deckr"
 license = "MIT"
