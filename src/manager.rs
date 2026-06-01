@@ -21,7 +21,7 @@ use deckr::nats::{NatsDeckrRuntime, NatsStateStore};
 use deckr::profiles::hardware::{
     HardwareBeaconPayload, HardwareClaimTerms, HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID,
 };
-use deckr::state::{StateStore, DEFAULT_STATE_RENEWAL_INTERVAL_SECONDS};
+use deckr::state::{StateMaintenancePolicy, StateStore};
 use futures_util::StreamExt;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
@@ -41,8 +41,6 @@ const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const USB_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BACKOFF_SECS: u64 = 10;
-const HEARTBEAT_SECONDS: u64 = DEFAULT_STATE_RENEWAL_INTERVAL_SECONDS;
-const STATE_RECONCILE_SECONDS: u64 = 1;
 const WATCH_RETRY_SECONDS: u64 = 1;
 
 type HardwareClaimManager = ConcordParticipantManager<NatsStateStore, NatsStateStore>;
@@ -115,23 +113,40 @@ pub struct SaitekRemoteManager {
     manager_id: String,
     session_id: String,
     backend: Arc<dyn Backend>,
+    state_policy: StateMaintenancePolicy,
 }
 
 impl SaitekRemoteManager {
     pub fn new(nats_url: String, manager_id: String) -> Result<Self> {
-        Ok(Self::with_backend(
+        Ok(Self::with_backend_and_state_policy(
             nats_url,
             manager_id,
             Arc::new(UsbBackend),
+            StateMaintenancePolicy::from_env()?,
         ))
     }
 
     pub fn with_backend(nats_url: String, manager_id: String, backend: Arc<dyn Backend>) -> Self {
+        Self::with_backend_and_state_policy(
+            nats_url,
+            manager_id,
+            backend,
+            StateMaintenancePolicy::default(),
+        )
+    }
+
+    fn with_backend_and_state_policy(
+        nats_url: String,
+        manager_id: String,
+        backend: Arc<dyn Backend>,
+        state_policy: StateMaintenancePolicy,
+    ) -> Self {
         Self {
             nats_url,
             manager_id,
             session_id: Uuid::new_v4().to_string(),
             backend,
+            state_policy,
         }
     }
 
@@ -161,6 +176,11 @@ impl SaitekRemoteManager {
         info!(
             "Connected manager {} to NATS at {}",
             self.manager_id, self.nats_url
+        );
+        info!(
+            "Saitek state maintenance intervals: beacon renewal={}s, routing reconciliation={}s",
+            self.state_policy.renewal_interval.as_secs(),
+            self.state_policy.reconcile_interval.as_secs()
         );
 
         let shared = Arc::new(Mutex::new(ManagerState::new(
@@ -201,7 +221,11 @@ impl SaitekRemoteManager {
             claim_manager.clone(),
         ));
         tasks.spawn(inbound_command_loop(runtime.clone(), shared.clone()));
-        tasks.spawn(hardware_advertisement_loop(runtime.clone(), shared.clone()));
+        tasks.spawn(hardware_advertisement_loop(
+            runtime.clone(),
+            shared.clone(),
+            self.state_policy.renewal_interval,
+        ));
         tasks.spawn(concord_state_watch_loop(
             runtime.clone(),
             shared.clone(),
@@ -210,6 +234,7 @@ impl SaitekRemoteManager {
         tasks.spawn(routing_reconciliation_loop(
             shared.clone(),
             claim_manager.clone(),
+            self.state_policy.reconcile_interval,
         ));
 
         tokio::select! {
@@ -286,10 +311,11 @@ impl ManagerState {
 async fn hardware_advertisement_loop(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
+    renewal_interval: Duration,
 ) -> Result<()> {
     loop {
         publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
-        time::sleep(Duration::from_secs(HEARTBEAT_SECONDS)).await;
+        time::sleep(renewal_interval).await;
     }
 }
 
@@ -400,6 +426,7 @@ async fn concord_state_watch_loop(
 async fn routing_reconciliation_loop(
     shared: Arc<Mutex<ManagerState>>,
     claim_manager: Arc<Mutex<HardwareClaimManager>>,
+    reconcile_interval: Duration,
 ) -> Result<()> {
     loop {
         if let Err(error) = reconcile_routing_current_state(
@@ -411,7 +438,7 @@ async fn routing_reconciliation_loop(
         {
             warn!("Saitek routing current state unavailable; reconciliation will retry: {error:#}");
         }
-        time::sleep(Duration::from_secs(STATE_RECONCILE_SECONDS)).await;
+        time::sleep(reconcile_interval).await;
     }
 }
 
