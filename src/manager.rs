@@ -9,17 +9,15 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use deckr::beacon::{AdvertisementHandle, BeaconAdvertiser};
 use deckr::concord::{
-    ConcordCoordinator, ConcordManagedContract, ConcordParticipantManager, ContractHandle,
-    ContractRecord,
+    ConcordContractNotification, ConcordCoordinator, ConcordManagedContract,
+    ConcordParticipantManager, ContractHandle, ContractRecord,
 };
 use deckr::endpoint::{hardware_manager_address, EndpointAddress};
 use deckr::hardware::{hardware_beacon_payload, HardwareClaimRouting};
 use deckr::lanes::{
     DeckrMessage, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
 };
-use deckr::nats::{
-    ConcordStateChangeSource, ConcordStateChangeStream, NatsDeckrRuntime, NatsStateStore,
-};
+use deckr::nats::{NatsDeckrRuntime, NatsStateStore};
 use deckr::profiles::hardware::{
     HardwareBeaconPayload, HardwareClaimTerms, HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID,
 };
@@ -44,7 +42,6 @@ const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const USB_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BACKOFF_SECS: u64 = 10;
 const WATCH_RETRY_SECONDS: u64 = 1;
-const WATCH_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(100);
 
 type HardwareClaimManager = ConcordParticipantManager<NatsStateStore, NatsStateStore>;
 
@@ -52,31 +49,6 @@ type HardwareClaimManager = ConcordParticipantManager<NatsStateStore, NatsStateS
 enum RoutingReconcileMode {
     Full,
     ManagedOnly,
-}
-
-#[derive(Debug, Default)]
-struct ConcordChangeBatch {
-    saw_contract: bool,
-    saw_token: bool,
-}
-
-impl ConcordChangeBatch {
-    fn record(&mut self, source: ConcordStateChangeSource) {
-        match source {
-            ConcordStateChangeSource::Contracts => self.saw_contract = true,
-            ConcordStateChangeSource::Tokens => self.saw_token = true,
-        }
-    }
-
-    fn reconcile_mode(&self) -> (RoutingReconcileMode, &'static str) {
-        if self.saw_contract {
-            (RoutingReconcileMode::Full, "contract watch")
-        } else if self.saw_token {
-            (RoutingReconcileMode::ManagedOnly, "token watch")
-        } else {
-            (RoutingReconcileMode::ManagedOnly, "empty watch batch")
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -447,7 +419,14 @@ async fn concord_state_watch_loop(
     claim_manager: Arc<Mutex<HardwareClaimManager>>,
 ) -> Result<()> {
     loop {
-        let mut stream = match runtime.watch_concord_changes().await {
+        let concord = ConcordCoordinator::new(
+            runtime.concord_contracts().clone(),
+            runtime.concord_tokens().clone(),
+        );
+        let mut stream = match concord
+            .watch_contract_notifications(Some(HARDWARE_CLAIM_PROFILE_ID))
+            .await
+        {
             Ok(stream) => stream,
             Err(error) => {
                 warn!("Saitek Concord state watch is unavailable; watch will retry: {error:#}");
@@ -455,15 +434,30 @@ async fn concord_state_watch_loop(
                 continue;
             }
         };
+        if let Err(error) = reconcile_routing_current_state(
+            shared.clone(),
+            claim_manager.clone(),
+            "contract watch warmup",
+            RoutingReconcileMode::Full,
+        )
+        .await
+        {
+            warn!("Saitek Concord watch warmup failed; watch will retry: {error:#}");
+            time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
+            continue;
+        }
         loop {
-            match next_concord_change_batch(&mut stream).await {
-                Ok(batch) => {
-                    let (mode, reason) = batch.reconcile_mode();
-                    reconcile_routing_current_state(
+            match stream.next().await {
+                Ok(notification) => {
+                    debug!(
+                        "Saitek Concord {} changed at {}",
+                        notification.source.reason(),
+                        notification.change.key
+                    );
+                    reconcile_routing_notification(
                         shared.clone(),
                         claim_manager.clone(),
-                        reason,
-                        mode,
+                        &notification,
                     )
                     .await?
                 }
@@ -472,36 +466,6 @@ async fn concord_state_watch_loop(
                     time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
                     break;
                 }
-            }
-        }
-    }
-}
-
-async fn next_concord_change_batch(
-    stream: &mut ConcordStateChangeStream,
-) -> Result<ConcordChangeBatch> {
-    let first = stream.next().await?;
-    debug!(
-        "Saitek Concord {} changed at {}",
-        first.source.reason(),
-        first.key
-    );
-    let mut batch = ConcordChangeBatch::default();
-    batch.record(first.source);
-    let debounce = time::sleep(WATCH_DEBOUNCE_INTERVAL);
-    tokio::pin!(debounce);
-
-    loop {
-        tokio::select! {
-            () = &mut debounce => return Ok(batch),
-            change = stream.next() => {
-                let change = change?;
-                debug!(
-                    "Saitek Concord {} changed at {}",
-                    change.source.reason(),
-                    change.key
-                );
-                batch.record(change.source);
             }
         }
     }
@@ -551,6 +515,55 @@ async fn routing_reconciliation_loop(
     }
 }
 
+async fn reconcile_routing_notification<C, T>(
+    shared: Arc<Mutex<ManagerState>>,
+    claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
+    notification: &ConcordContractNotification,
+) -> Result<()>
+where
+    C: StateStore,
+    T: StateStore,
+{
+    let (manager_id, manager_endpoint, current_devices) = {
+        let state = shared.lock().await;
+        (
+            state.manager_id.clone(),
+            state.endpoint.clone(),
+            state.devices.clone(),
+        )
+    };
+    let manager_endpoint = EndpointAddress::parse(&manager_endpoint)?;
+    let known_devices = current_devices.keys().cloned().collect::<BTreeSet<_>>();
+
+    let managed_contracts = {
+        let mut claim_manager = claim_manager.lock().await;
+        claim_manager
+            .reconcile_notification(
+                notification,
+                |contract, record| -> deckr::Result<bool> {
+                    accept_current_hardware_claim(
+                        contract,
+                        record,
+                        &manager_endpoint,
+                        &manager_id,
+                        &current_devices,
+                    )
+                },
+                None,
+            )
+            .await?
+    };
+
+    reconcile_routing_from_managed(
+        shared,
+        managed_contracts,
+        &manager_endpoint,
+        &known_devices,
+        notification.source.reason(),
+    )
+    .await
+}
+
 async fn reconcile_routing_current_state<C, T>(
     shared: Arc<Mutex<ManagerState>>,
     claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
@@ -595,13 +608,30 @@ where
         }
     };
 
+    reconcile_routing_from_managed(
+        shared,
+        managed_contracts,
+        &manager_endpoint,
+        &known_devices,
+        reason,
+    )
+    .await
+}
+
+async fn reconcile_routing_from_managed(
+    shared: Arc<Mutex<ManagerState>>,
+    managed_contracts: Vec<ConcordManagedContract>,
+    manager_endpoint: &EndpointAddress,
+    known_devices: &BTreeSet<String>,
+    reason: &'static str,
+) -> Result<()> {
     debug!("Reconciling Saitek routing current state via {reason}");
     let (senders_to_reset, ignored_claims) = {
         let mut state = shared.lock().await;
         let reconcile =
             state
                 .routing
-                .reconcile_claims(&managed_contracts, &manager_endpoint, &known_devices);
+                .reconcile_claims(&managed_contracts, manager_endpoint, known_devices);
         let senders = reconcile
             .reset_devices
             .into_iter()
