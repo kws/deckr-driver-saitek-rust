@@ -297,6 +297,9 @@ fn button_input(
         capability_id: BUTTON_MOMENTARY_CAPABILITY_ID.to_string(),
         event_type: event_type.to_string(),
         value: Some(json!({"eventType": event_type})),
+        occurred_at: None,
+        sequence: None,
+        sources: Vec::new(),
     })
 }
 
@@ -314,6 +317,9 @@ fn encoder_input(
         capability_id: ENCODER_RELATIVE_CAPABILITY_ID.to_string(),
         event_type: "rotate".to_string(),
         value: Some(json!({"delta": delta, "direction": direction})),
+        occurred_at: None,
+        sequence: None,
+        sources: Vec::new(),
     })
 }
 

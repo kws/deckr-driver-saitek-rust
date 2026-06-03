@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -10,19 +10,20 @@ use base64::Engine;
 use deckr::beacon::{AdvertisementHandle, BeaconAdvertiser};
 use deckr::concord::{
     ConcordContractNotification, ConcordCoordinator, ConcordManagedContract,
-    ConcordParticipantManager, ContractHandle, ContractRecord,
+    ConcordParticipantManager,
 };
 use deckr::endpoint::{hardware_manager_address, EndpointAddress};
-use deckr::hardware::{hardware_beacon_payload, HardwareClaimRouting};
+use deckr::hardware::runtime::{
+    accept_current_hardware_claim, HardwareCommandDecision, HardwareManagerRuntime,
+};
 use deckr::lanes::{
     DeckrMessage, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
 };
-use deckr::nats::{NatsDeckrRuntime, NatsStateStore};
+use deckr::nats::{DeckrRuntime, NatsDeckrRuntime, NatsStateStore};
 use deckr::profiles::hardware::{
     HardwareBeaconPayload, HardwareClaimTerms, HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID,
 };
 use deckr::state::{StateMaintenancePolicy, StateStore};
-use futures_util::StreamExt;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
 use tokio::time;
@@ -174,11 +175,10 @@ impl SaitekRemoteManager {
     }
 
     async fn run_connected_session(&self) -> Result<()> {
-        let runtime = Arc::new(
-            NatsDeckrRuntime::connect(&self.nats_url)
-                .await
-                .with_context(|| format!("connecting manager {} to NATS", self.manager_id))?,
-        );
+        let deckr_runtime = DeckrRuntime::connect(self.nats_url.as_str())
+            .await
+            .with_context(|| format!("connecting manager {} to NATS", self.manager_id))?;
+        let runtime = Arc::new(deckr_runtime.nats().clone());
         info!(
             "Connected manager {} to NATS at {}",
             self.manager_id, self.nats_url
@@ -281,43 +281,28 @@ impl SaitekRemoteManager {
 }
 
 struct ManagerState {
-    manager_id: String,
-    endpoint: String,
-    session_id: String,
+    hardware: HardwareManagerRuntime,
     advertisement_id: String,
-    devices: BTreeMap<String, deckr::lanes::DeviceDescriptor>,
     command_map: HashMap<String, Sender<RuntimeCommand>>,
-    routing: HardwareClaimRouting,
     advertisement_handle: Option<AdvertisementHandle>,
     advertisement_dirty: bool,
 }
 
 impl ManagerState {
     fn new(manager_id: String, session_id: String) -> Self {
-        let endpoint = hardware_manager_address(&manager_id);
         let advertisement_id = format!("hardware-{manager_id}-{session_id}");
         Self {
-            manager_id,
-            endpoint,
-            session_id,
+            hardware: HardwareManagerRuntime::new(manager_id, session_id)
+                .expect("manager id and session id should build a hardware runtime"),
             advertisement_id,
-            devices: BTreeMap::new(),
             command_map: HashMap::new(),
-            routing: HardwareClaimRouting::default(),
             advertisement_handle: None,
             advertisement_dirty: false,
         }
     }
 
     fn hardware_payload(&self) -> Result<HardwareBeaconPayload> {
-        Ok(hardware_beacon_payload(
-            &self.manager_id,
-            EndpointAddress::parse(&self.endpoint)?,
-            &self.session_id,
-            BTreeMap::new(),
-            &self.devices,
-            &self.routing.claimed_device_ids(),
-        )?)
+        Ok(self.hardware.advertisement_payload()?)
     }
 }
 
@@ -354,8 +339,8 @@ async fn publish_hardware_advertisement(
         let advertiser = BeaconAdvertiser::new(
             runtime.beacon_advertisements().clone(),
             HARDWARE_FEATURE_ID,
-            EndpointAddress::parse(&state.endpoint)?,
-            state.session_id.clone(),
+            state.hardware.endpoint().clone(),
+            state.hardware.session_id().to_string(),
         )
         .advertisement_id(state.advertisement_id.clone())
         .payload(payload);
@@ -392,20 +377,14 @@ async fn withdraw_hardware_advertisement_safely(
                 return;
             }
         };
-        let advertiser = match EndpointAddress::parse(&state.endpoint) {
-            Ok(endpoint) => BeaconAdvertiser::new(
-                runtime.beacon_advertisements().clone(),
-                HARDWARE_FEATURE_ID,
-                endpoint,
-                state.session_id.clone(),
-            )
-            .advertisement_id(state.advertisement_id.clone())
-            .payload(payload),
-            Err(error) => {
-                warn!("Failed to withdraw Saitek hardware advertisement: {error:#}");
-                return;
-            }
-        };
+        let advertiser = BeaconAdvertiser::new(
+            runtime.beacon_advertisements().clone(),
+            HARDWARE_FEATURE_ID,
+            state.hardware.endpoint().clone(),
+            state.hardware.session_id().to_string(),
+        )
+        .advertisement_id(state.advertisement_id.clone())
+        .payload(payload);
         (advertiser, handle)
     };
     if let Err(error) = advertiser.withdraw(&handle).await {
@@ -527,13 +506,11 @@ where
     let (manager_id, manager_endpoint, current_devices) = {
         let state = shared.lock().await;
         (
-            state.manager_id.clone(),
-            state.endpoint.clone(),
-            state.devices.clone(),
+            state.hardware.manager_id().to_string(),
+            state.hardware.endpoint().clone(),
+            state.hardware.devices().clone(),
         )
     };
-    let manager_endpoint = EndpointAddress::parse(&manager_endpoint)?;
-    let known_devices = current_devices.keys().cloned().collect::<BTreeSet<_>>();
 
     let managed_contracts = {
         let mut claim_manager = claim_manager.lock().await;
@@ -554,14 +531,7 @@ where
             .await?
     };
 
-    reconcile_routing_from_managed(
-        shared,
-        managed_contracts,
-        &manager_endpoint,
-        &known_devices,
-        notification.source.reason(),
-    )
-    .await
+    reconcile_routing_from_managed(shared, managed_contracts, notification.source.reason()).await
 }
 
 async fn reconcile_routing_current_state<C, T>(
@@ -577,13 +547,11 @@ where
     let (manager_id, manager_endpoint, current_devices) = {
         let state = shared.lock().await;
         (
-            state.manager_id.clone(),
-            state.endpoint.clone(),
-            state.devices.clone(),
+            state.hardware.manager_id().to_string(),
+            state.hardware.endpoint().clone(),
+            state.hardware.devices().clone(),
         )
     };
-    let manager_endpoint = EndpointAddress::parse(&manager_endpoint)?;
-    let known_devices = current_devices.keys().cloned().collect::<BTreeSet<_>>();
 
     let managed_contracts = {
         let mut claim_manager = claim_manager.lock().await;
@@ -608,30 +576,18 @@ where
         }
     };
 
-    reconcile_routing_from_managed(
-        shared,
-        managed_contracts,
-        &manager_endpoint,
-        &known_devices,
-        reason,
-    )
-    .await
+    reconcile_routing_from_managed(shared, managed_contracts, reason).await
 }
 
 async fn reconcile_routing_from_managed(
     shared: Arc<Mutex<ManagerState>>,
     managed_contracts: Vec<ConcordManagedContract>,
-    manager_endpoint: &EndpointAddress,
-    known_devices: &BTreeSet<String>,
     reason: &'static str,
 ) -> Result<()> {
     debug!("Reconciling Saitek routing current state via {reason}");
     let (senders_to_reset, ignored_claims) = {
         let mut state = shared.lock().await;
-        let reconcile =
-            state
-                .routing
-                .reconcile_claims(&managed_contracts, manager_endpoint, known_devices);
+        let reconcile = state.hardware.reconcile_claims(&managed_contracts);
         let senders = reconcile
             .reset_devices
             .into_iter()
@@ -651,62 +607,6 @@ async fn reconcile_routing_from_managed(
     Ok(())
 }
 
-fn accept_current_hardware_claim(
-    contract: &ContractHandle,
-    record: &ContractRecord,
-    manager_endpoint: &EndpointAddress,
-    manager_id: &str,
-    current_devices: &BTreeMap<String, deckr::lanes::DeviceDescriptor>,
-) -> deckr::Result<bool> {
-    if !contract.participants.contains(manager_endpoint) {
-        return Ok(false);
-    }
-    let Some(terms_value) = record.terms.clone() else {
-        return Ok(false);
-    };
-    let terms = match HardwareClaimTerms::from_value(terms_value) {
-        Ok(terms) => terms,
-        Err(error) => {
-            warn!(
-                "Ignoring invalid Saitek hardware claim contract {}: {error}",
-                contract.key
-            );
-            return Ok(false);
-        }
-    };
-    if &terms.manager_endpoint != manager_endpoint {
-        return Ok(false);
-    }
-    if terms.manager_endpoint.endpoint_id() != manager_id {
-        return Ok(false);
-    }
-    for device in &terms.devices {
-        let device_ref = &device.device_ref;
-        if device_ref.manager_id != manager_id {
-            return Ok(false);
-        }
-        let Some(current) = current_devices.get(&device_ref.device_id) else {
-            debug!(
-                "Rejecting Saitek hardware claim contract {} for absent device {}",
-                contract.key, device_ref.device_id
-            );
-            return Ok(false);
-        };
-        if device_ref
-            .fingerprint
-            .as_ref()
-            .is_some_and(|fingerprint| fingerprint != &current.fingerprint)
-        {
-            debug!(
-                "Rejecting Saitek hardware claim contract {} for fingerprint mismatch on device {}",
-                contract.key, device_ref.device_id
-            );
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 async fn worker_event_loop(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
@@ -724,7 +624,7 @@ async fn worker_event_loop(
                 debug!("Saitek device connected path={path_key} device={device_id}");
                 {
                     let mut state = shared.lock().await;
-                    state.devices.insert(device_id.clone(), device);
+                    state.hardware.set_device(device)?;
                     state.command_map.insert(device_id.clone(), command_tx);
                 }
                 publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
@@ -740,35 +640,14 @@ async fn worker_event_loop(
                 if !matches!(body, HardwareMessageBody::ControlInput { .. }) {
                     continue;
                 }
-                let route = {
+                let message = {
                     let state = shared.lock().await;
-                    state.routing.claim_recipient(&device_id).map(|recipient| {
-                        (
-                            state.session_id.clone(),
-                            recipient.endpoint.to_string(),
-                            recipient.session_id.to_string(),
-                        )
-                    })
+                    state.hardware.route_hardware_message(body)?
                 };
-                let Some((manager_session_id, recipient_endpoint, recipient_session_id)) = route
-                else {
+                let Some(message) = message else {
                     debug!("Dropping unclaimed Saitek input for {device_id}");
                     continue;
                 };
-                let manager_id = match &body {
-                    HardwareMessageBody::ControlInput { device_ref, .. } => {
-                        device_ref.manager_id.clone()
-                    }
-                    _ => unreachable!(),
-                };
-                let message = DeckrMessage::hardware_input_to(
-                    &manager_id,
-                    &manager_session_id,
-                    &device_id,
-                    &recipient_endpoint,
-                    &recipient_session_id,
-                    body,
-                )?;
                 runtime.publish(&message).await?;
             }
             WorkerEvent::Disconnected {
@@ -779,9 +658,8 @@ async fn worker_event_loop(
                 let managed_contracts = { claim_manager.lock().await.managed_contracts() };
                 {
                     let mut state = shared.lock().await;
-                    state.devices.remove(&device_id);
                     state.command_map.remove(&device_id);
-                    state.routing.remove_device(&device_id);
+                    state.hardware.remove_device(&device_id);
                 }
                 publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
                 cancel_managed_device_claims(
@@ -864,10 +742,18 @@ async fn inbound_command_loop(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
 ) -> Result<()> {
-    let mut subscriber = runtime.subscribe_hardware_messages().await?;
+    let endpoint = {
+        let state = shared.lock().await;
+        state.hardware.endpoint().clone()
+    };
+    let mut subscriber = runtime
+        .subscribe_endpoint_hardware_messages(&endpoint)
+        .await?;
     while let Some(message) = subscriber.next().await {
         match runtime.message_from_nats(message) {
-            Ok(envelope) => route_inbound_command(shared.clone(), envelope).await?,
+            Ok(envelope) => {
+                route_inbound_command(Some(runtime.clone()), shared.clone(), envelope).await?
+            }
             Err(error) => debug!("Dropping invalid NATS Deckr lane message: {error:#}"),
         }
     }
@@ -875,71 +761,55 @@ async fn inbound_command_loop(
 }
 
 async fn route_inbound_command(
+    runtime: Option<Arc<NatsDeckrRuntime>>,
     shared: Arc<Mutex<ManagerState>>,
     envelope: DeckrMessage,
 ) -> Result<()> {
-    if envelope.lane != WIRE_HARDWARE_LANE || envelope.is_expired() {
+    if envelope.lane != WIRE_HARDWARE_LANE {
         return Ok(());
     }
-    let body = match envelope.hardware_body() {
-        Ok(body) => body,
-        Err(error) => {
-            debug!("Ignoring unsupported hardware message body: {error:#}");
+    let decision = {
+        let state = shared.lock().await;
+        state.hardware.authorize_command(envelope)?
+    };
+    let (device_id, body, sender_endpoint, sender_session_id) = match decision {
+        HardwareCommandDecision::Authorized {
+            device_id,
+            body,
+            sender,
+            sender_session_id,
+        } => (device_id, body, sender, sender_session_id),
+        HardwareCommandDecision::Rejected { reason, reply } => {
+            debug!("Rejecting Saitek hardware command: {reason}");
+            if let (Some(runtime), Some(reply)) = (runtime.as_ref(), reply) {
+                runtime.publish(&reply).await?;
+            }
             return Ok(());
         }
+        HardwareCommandDecision::Ignored => return Ok(()),
     };
-    if !body.is_command() {
-        return Ok(());
-    }
-    let Some(device_id) = envelope.subject.device_id().map(str::to_string) else {
-        debug!("Ignoring inbound hardware command without device subject");
-        return Ok(());
-    };
-    let Some(subject_manager_id) = envelope.subject.manager_id() else {
-        return Ok(());
-    };
-    let command = match runtime_command_from_body(body) {
+    let command = match runtime_command_from_body(body.clone()) {
         Ok(command) => command,
         Err(error) => {
             debug!("Ignoring unsupported hardware command: {error:#}");
+            let reply = {
+                let state = shared.lock().await;
+                state.hardware.rejection_reply_to(
+                    &sender_endpoint,
+                    &sender_session_id,
+                    body,
+                    "unsupported",
+                    Some(&error.to_string()),
+                )?
+            };
+            if let (Some(runtime), Some(reply)) = (runtime.as_ref(), reply) {
+                runtime.publish(&reply).await?;
+            }
             return Ok(());
         }
     };
     let sender = {
         let state = shared.lock().await;
-        if envelope.recipient_endpoint() != Some(state.endpoint.as_str()) {
-            return Ok(());
-        }
-        if !envelope.is_directly_deliverable_to(
-            &EndpointAddress::parse(&state.endpoint)?,
-            &state.session_id,
-        )? {
-            return Ok(());
-        }
-        if subject_manager_id != state.manager_id {
-            return Ok(());
-        }
-        if !state.devices.contains_key(&device_id) {
-            debug!(
-                "Dropping command for unknown Saitek device {}/{}",
-                subject_manager_id, device_id
-            );
-            return Ok(());
-        }
-        if state
-            .routing
-            .claim_recipient(&device_id)
-            .is_none_or(|recipient| {
-                recipient.endpoint.as_str() != envelope.sender
-                    || recipient.session_id != envelope.sender_session_id
-            })
-        {
-            debug!(
-                "Dropping unroutable Saitek command for {}/{} from {}",
-                subject_manager_id, device_id, envelope.sender
-            );
-            return Ok(());
-        }
         state.command_map.get(&device_id).cloned()
     };
     if let Some(sender) = sender {
@@ -947,10 +817,7 @@ async fn route_inbound_command(
             warn!("Dropping command for disconnected device {device_id}");
         }
     } else {
-        debug!(
-            "Dropping command for closed Saitek device {}/{}",
-            subject_manager_id, device_id
-        );
+        debug!("Dropping command for closed Saitek device {device_id}");
     }
     Ok(())
 }
@@ -1434,14 +1301,14 @@ fn apply_runtime_command(handle: &mut dyn DeviceHandle, command: RuntimeCommand)
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
     use std::sync::{Arc, Mutex as StdMutex};
 
     use super::*;
     use crate::protocol::{FipControlPacket, REQ_CLEAR_IMAGE, REQ_PROBE, REQ_SET_IMAGE};
     use deckr::beacon::find_candidates;
     use deckr::concord::{ContractHandle, ContractValidityStatus};
-    use deckr::hardware::HardwareClaimRoute;
+    use deckr::hardware::{HardwareClaimRoute, HardwareClaimRouting};
     use deckr::lanes::DeviceRef;
     use deckr::state::MemoryStateStore;
 
@@ -1748,10 +1615,14 @@ mod tests {
         )));
         {
             let mut state = shared.lock().await;
-            state.devices.insert(
-                device_id.to_string(),
-                device_descriptor(&sample_candidate(), device_id, fingerprint),
-            );
+            state
+                .hardware
+                .set_device(device_descriptor(
+                    &sample_candidate(),
+                    device_id,
+                    fingerprint,
+                ))
+                .unwrap();
         }
         shared
     }
@@ -1868,10 +1739,14 @@ mod tests {
     #[test]
     fn hardware_advertisement_payload_uses_deckr_profile_api() {
         let mut state = ManagerState::new("saitek-main".to_string(), "manager-session".to_string());
-        state.devices.insert(
-            "fip".to_string(),
-            device_descriptor(&sample_candidate(), "fip", "fingerprint:fip"),
-        );
+        state
+            .hardware
+            .set_device(device_descriptor(
+                &sample_candidate(),
+                "fip",
+                "fingerprint:fip",
+            ))
+            .unwrap();
 
         let payload = state.hardware_payload().unwrap();
         let value = payload.to_value().unwrap();
@@ -1989,7 +1864,13 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        assert!(shared.lock().await.routing.claim_recipient("fip").is_some());
+        assert!(shared
+            .lock()
+            .await
+            .hardware
+            .routing()
+            .claim_recipient("fip")
+            .is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2049,7 +1930,13 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(shared.lock().await.routing.claim_recipient("fip").is_some());
+        assert!(shared
+            .lock()
+            .await
+            .hardware
+            .routing()
+            .claim_recipient("fip")
+            .is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2081,7 +1968,8 @@ mod tests {
         assert!(shared
             .lock()
             .await
-            .routing
+            .hardware
+            .routing()
             .claim_recipient("missing-fip")
             .is_none());
     }
@@ -2139,7 +2027,13 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        assert!(shared.lock().await.routing.claim_recipient("fip").is_some());
+        assert!(shared
+            .lock()
+            .await
+            .hardware
+            .routing()
+            .claim_recipient("fip")
+            .is_some());
     }
 
     #[test]
@@ -2220,12 +2114,16 @@ mod tests {
         )));
         {
             let mut state = shared.lock().await;
-            state.devices.insert(
-                "fip".to_string(),
-                device_descriptor(&sample_candidate(), "fip", "fingerprint:fip"),
-            );
+            state
+                .hardware
+                .set_device(device_descriptor(
+                    &sample_candidate(),
+                    "fip",
+                    "fingerprint:fip",
+                ))
+                .unwrap();
             state.command_map.insert("fip".to_string(), command_tx);
-            state.routing.reconcile_snapshot(
+            state.hardware.reconcile_routing_snapshot(
                 HashMap::from([(
                     "fip".to_string(),
                     HardwareClaimRoute {
@@ -2248,7 +2146,9 @@ mod tests {
             raster_command("set_frame"),
         )
         .unwrap();
-        route_inbound_command(shared.clone(), wrong).await.unwrap();
+        route_inbound_command(None, shared.clone(), wrong)
+            .await
+            .unwrap();
         assert!(command_rx.try_recv().is_err());
 
         let stale_manager_session = DeckrMessage::hardware_command(
@@ -2260,7 +2160,7 @@ mod tests {
             raster_command("set_frame"),
         )
         .unwrap();
-        route_inbound_command(shared.clone(), stale_manager_session)
+        route_inbound_command(None, shared.clone(), stale_manager_session)
             .await
             .unwrap();
         assert!(command_rx.try_recv().is_err());
@@ -2274,7 +2174,7 @@ mod tests {
             raster_command("set_frame"),
         )
         .unwrap();
-        route_inbound_command(shared, right).await.unwrap();
+        route_inbound_command(None, shared, right).await.unwrap();
         assert!(matches!(
             command_rx.try_recv().unwrap(),
             RuntimeCommand::SetRasterFrame { .. }
