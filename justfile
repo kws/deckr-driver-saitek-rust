@@ -13,6 +13,9 @@ fmt:
 clippy:
     cargo clippy --all-targets --all-features -- -D warnings
 
+openwrt-pi1:
+    ./scripts/build-openwrt-pi1.sh
+
 cross-images:
     docker build -f docker/rust-cross/x86_64-unknown-linux-gnu.Dockerfile -t deckr-saitek-cross:x86_64-unknown-linux-gnu .
     docker build -f docker/rust-cross/aarch64-unknown-linux-gnu.Dockerfile -t deckr-saitek-cross:aarch64-unknown-linux-gnu .
