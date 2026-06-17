@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
@@ -43,6 +43,7 @@ const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const USB_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BACKOFF_SECS: u64 = 10;
 const WATCH_RETRY_SECONDS: u64 = 1;
+const COMMAND_QUEUE_CAPACITY: usize = 32;
 
 type HardwareClaimManager = ConcordParticipantManager<NatsStateStore, NatsStateStore>;
 
@@ -66,12 +67,226 @@ pub enum RuntimeCommand {
     Stop,
 }
 
+impl RuntimeCommand {
+    fn is_stop(&self) -> bool {
+        matches!(self, Self::Stop)
+    }
+
+    fn is_reset(&self) -> bool {
+        matches!(self, Self::ResetDevice)
+    }
+
+    fn raster_control_id(&self) -> Option<&str> {
+        match self {
+            Self::SetRasterFrame { control_id, .. } | Self::ClearRaster { control_id } => {
+                Some(control_id)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommandSendError;
+
+struct CommandQueueInner {
+    state: StdMutex<CommandQueueState>,
+    available: Condvar,
+}
+
+struct CommandQueueState {
+    queue: VecDeque<RuntimeCommand>,
+    sender_count: usize,
+    receiver_alive: bool,
+}
+
+struct CommandSender {
+    inner: Arc<CommandQueueInner>,
+}
+
+struct CommandReceiver {
+    inner: Arc<CommandQueueInner>,
+}
+
+fn command_channel() -> (CommandSender, CommandReceiver) {
+    let inner = Arc::new(CommandQueueInner {
+        state: StdMutex::new(CommandQueueState {
+            queue: VecDeque::new(),
+            sender_count: 1,
+            receiver_alive: true,
+        }),
+        available: Condvar::new(),
+    });
+    (
+        CommandSender {
+            inner: inner.clone(),
+        },
+        CommandReceiver { inner },
+    )
+}
+
+impl std::fmt::Debug for CommandSender {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CommandSender { .. }")
+    }
+}
+
+impl Clone for CommandSender {
+    fn clone(&self) -> Self {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("command queue mutex should not be poisoned");
+        state.sender_count += 1;
+        drop(state);
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl Drop for CommandSender {
+    fn drop(&mut self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("command queue mutex should not be poisoned");
+        state.sender_count = state.sender_count.saturating_sub(1);
+        if state.sender_count == 0 {
+            self.inner.available.notify_all();
+        }
+    }
+}
+
+impl CommandSender {
+    fn send(&self, command: RuntimeCommand) -> std::result::Result<(), CommandSendError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("command queue mutex should not be poisoned");
+        if !state.receiver_alive {
+            return Err(CommandSendError);
+        }
+
+        if command.is_stop() {
+            state.queue.clear();
+            state.queue.push_front(command);
+            self.inner.available.notify_all();
+            return Ok(());
+        }
+
+        if state.queue.iter().any(RuntimeCommand::is_stop) {
+            return Ok(());
+        }
+
+        if command.is_reset() {
+            state.queue.clear();
+            state.queue.push_front(command);
+            self.inner.available.notify_one();
+            return Ok(());
+        }
+
+        enqueue_bounded_command(&mut state.queue, command);
+        self.inner.available.notify_one();
+        Ok(())
+    }
+}
+
+impl Drop for CommandReceiver {
+    fn drop(&mut self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("command queue mutex should not be poisoned");
+        state.receiver_alive = false;
+        self.inner.available.notify_all();
+    }
+}
+
+impl CommandReceiver {
+    fn try_recv(&self) -> std::result::Result<RuntimeCommand, TryRecvError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("command queue mutex should not be poisoned");
+        if let Some(command) = state.queue.pop_front() {
+            return Ok(command);
+        }
+        if state.sender_count == 0 {
+            Err(TryRecvError::Disconnected)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<RuntimeCommand, RecvTimeoutError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("command queue mutex should not be poisoned");
+        loop {
+            if let Some(command) = state.queue.pop_front() {
+                return Ok(command);
+            }
+            if state.sender_count == 0 {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_state, _) = self
+                .inner
+                .available
+                .wait_timeout(state, remaining)
+                .expect("command queue mutex should not be poisoned");
+            state = next_state;
+        }
+    }
+}
+
+fn enqueue_bounded_command(queue: &mut VecDeque<RuntimeCommand>, command: RuntimeCommand) {
+    if let Some(control_id) = command.raster_control_id().map(ToOwned::to_owned) {
+        queue.retain(|queued| queued.raster_control_id() != Some(control_id.as_str()));
+    }
+    while queue.len() >= COMMAND_QUEUE_CAPACITY {
+        if let Some(index) = queue
+            .iter()
+            .position(|queued| matches!(queued, RuntimeCommand::SetRasterFrame { .. }))
+        {
+            queue.remove(index);
+        } else if let Some(index) = queue
+            .iter()
+            .position(|queued| !queued.is_stop() && !queued.is_reset())
+        {
+            queue.remove(index);
+        } else {
+            break;
+        }
+    }
+    if queue.len() < COMMAND_QUEUE_CAPACITY {
+        queue.push_back(command);
+    }
+}
+
 #[derive(Debug, Clone)]
 enum WorkerEvent {
     Connected {
         path_key: String,
         device_id: String,
-        command_tx: Sender<RuntimeCommand>,
+        command_tx: CommandSender,
         device: deckr::lanes::DeviceDescriptor,
     },
     Input {
@@ -94,7 +309,7 @@ enum WorkerReport {
         worker_id: u64,
         path_key: String,
         device_id: String,
-        command_tx: Sender<RuntimeCommand>,
+        command_tx: CommandSender,
         device: deckr::lanes::DeviceDescriptor,
     },
     Input {
@@ -283,7 +498,7 @@ impl SaitekRemoteManager {
 struct ManagerState {
     hardware: HardwareManagerRuntime,
     advertisement_id: String,
-    command_map: HashMap<String, Sender<RuntimeCommand>>,
+    command_map: HashMap<String, CommandSender>,
     advertisement_handle: Option<AdvertisementHandle>,
     advertisement_dirty: bool,
 }
@@ -897,14 +1112,14 @@ struct Supervisor {
 #[derive(Debug, Clone)]
 struct LaunchedWorker {
     worker_id: u64,
-    command_tx: Sender<RuntimeCommand>,
+    command_tx: CommandSender,
 }
 
 #[derive(Debug, Clone)]
 struct ActiveWorker {
     worker_id: u64,
     device_id: String,
-    command_tx: Sender<RuntimeCommand>,
+    command_tx: CommandSender,
 }
 
 impl Supervisor {
@@ -994,7 +1209,7 @@ impl Supervisor {
             }
             self.next_worker_id += 1;
             let worker_id = self.next_worker_id;
-            let (command_tx, command_rx) = mpsc::channel::<RuntimeCommand>();
+            let (command_tx, command_rx) = command_channel();
             self.launched_workers.insert(
                 path_key,
                 LaunchedWorker {
@@ -1144,8 +1359,8 @@ fn spawn_device_worker(
     backend: Arc<dyn Backend>,
     descriptor: DeviceCandidate,
     worker_tx: tokio_mpsc::UnboundedSender<WorkerReport>,
-    command_tx: Sender<RuntimeCommand>,
-    command_rx: mpsc::Receiver<RuntimeCommand>,
+    command_tx: CommandSender,
+    command_rx: CommandReceiver,
 ) {
     let path_key = descriptor.path_key();
     thread::spawn(move || {
@@ -1173,8 +1388,8 @@ fn device_worker(
     manager_id: String,
     descriptor: DeviceCandidate,
     worker_tx: tokio_mpsc::UnboundedSender<WorkerReport>,
-    command_tx: Sender<RuntimeCommand>,
-    command_rx: mpsc::Receiver<RuntimeCommand>,
+    command_tx: CommandSender,
+    command_rx: CommandReceiver,
 ) -> Result<()> {
     let path_key = descriptor.path_key();
     let local_device_id = descriptor.hardware_id();
@@ -1628,11 +1843,76 @@ mod tests {
     }
 
     #[test]
+    fn command_queue_keeps_latest_raster_frame_per_control() {
+        let (command_tx, command_rx) = command_channel();
+
+        for value in 0..COMMAND_QUEUE_CAPACITY * 4 {
+            command_tx
+                .send(RuntimeCommand::SetRasterFrame {
+                    control_id: SCREEN_CONTROL_ID.to_string(),
+                    encoding: "png".to_string(),
+                    image: vec![value as u8],
+                })
+                .unwrap();
+        }
+
+        match command_rx.try_recv().unwrap() {
+            RuntimeCommand::SetRasterFrame {
+                control_id, image, ..
+            } => {
+                assert_eq!(control_id, SCREEN_CONTROL_ID);
+                assert_eq!(image, vec![(COMMAND_QUEUE_CAPACITY * 4 - 1) as u8]);
+            }
+            other => panic!("expected latest raster frame, got {other:?}"),
+        }
+        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn command_queue_preserves_stop_priority() {
+        let (command_tx, command_rx) = command_channel();
+
+        for index in 0..COMMAND_QUEUE_CAPACITY * 4 {
+            command_tx
+                .send(RuntimeCommand::SetRasterFrame {
+                    control_id: format!("control-{index}"),
+                    encoding: "png".to_string(),
+                    image: vec![index as u8],
+                })
+                .unwrap();
+        }
+        command_tx.send(RuntimeCommand::Stop).unwrap();
+
+        assert!(matches!(command_rx.try_recv().unwrap(), RuntimeCommand::Stop));
+        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn command_queue_preserves_reset_priority() {
+        let (command_tx, command_rx) = command_channel();
+
+        command_tx
+            .send(RuntimeCommand::SetRasterFrame {
+                control_id: SCREEN_CONTROL_ID.to_string(),
+                encoding: "png".to_string(),
+                image: b"stale".to_vec(),
+            })
+            .unwrap();
+        command_tx.send(RuntimeCommand::ResetDevice).unwrap();
+
+        assert!(matches!(
+            command_rx.try_recv().unwrap(),
+            RuntimeCommand::ResetDevice
+        ));
+        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
     fn supervisor_disconnects_active_worker_when_path_disappears() {
         let (mut supervisor, mut manager_rx) = supervisor_for_tests();
         let path_key = sample_candidate().path_key();
         let device_id = sample_candidate().hardware_id();
-        let (command_tx, command_rx) = mpsc::channel::<RuntimeCommand>();
+        let (command_tx, command_rx) = command_channel();
         supervisor.active_workers.insert(
             path_key.clone(),
             ActiveWorker {
@@ -1658,7 +1938,7 @@ mod tests {
         let (mut supervisor, mut manager_rx) = supervisor_for_tests();
         let path_key = sample_candidate().path_key();
         let device_id = sample_candidate().hardware_id();
-        let (command_tx, _command_rx) = mpsc::channel::<RuntimeCommand>();
+        let (command_tx, _command_rx) = command_channel();
         supervisor.active_workers.insert(
             path_key.clone(),
             ActiveWorker {
@@ -1693,7 +1973,7 @@ mod tests {
         let (mut supervisor, mut manager_rx) = supervisor_for_tests();
         let path_key = sample_candidate().path_key();
         let device_id = sample_candidate().hardware_id();
-        let (old_command_tx, old_command_rx) = mpsc::channel::<RuntimeCommand>();
+        let (old_command_tx, old_command_rx) = command_channel();
         supervisor.active_workers.insert(
             path_key.clone(),
             ActiveWorker {
@@ -1709,7 +1989,7 @@ mod tests {
         ));
         assert_next_disconnected(&mut manager_rx, &path_key, &device_id);
 
-        let (new_command_tx, _new_command_rx) = mpsc::channel::<RuntimeCommand>();
+        let (new_command_tx, _new_command_rx) = command_channel();
         supervisor.active_workers.insert(
             path_key.clone(),
             ActiveWorker {
@@ -2107,7 +2387,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn command_routing_requires_claiming_controller() {
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = command_channel();
         let shared = Arc::new(Mutex::new(ManagerState::new(
             "saitek-main".to_string(),
             "manager-session".to_string(),

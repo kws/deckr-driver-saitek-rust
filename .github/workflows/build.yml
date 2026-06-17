@@ -68,9 +68,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
 
       - name: Check formatting
         working-directory: ${{ env.DRIVER_DIR }}
@@ -83,6 +86,89 @@ jobs:
       - name: Run unit tests
         working-directory: ${{ env.DRIVER_DIR }}
         run: cargo test
+
+      - name: Run dependency audit
+        working-directory: ${{ env.DRIVER_DIR }}
+        run: cargo audit
+
+  native-build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: deckr-saitek-manager-macos-x86_64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: deckr-saitek-manager-macos-aarch64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          path: ${{ env.DRIVER_DIR }}
+
+      - name: Check out Deckr dependency
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.DECKR_REPOSITORY }}
+          path: deckr
+          token: ${{ secrets.DECKR_REPO_TOKEN || github.token }}
+
+      - name: Align Deckr dependency ref when available
+        shell: bash
+        working-directory: deckr
+        env:
+          DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "${DECKR_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            git fetch --depth=1 origin "${DECKR_REF}"
+            git checkout --detach "${DECKR_REF}"
+          elif git ls-remote --exit-code origin "refs/heads/${DECKR_REF}" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "refs/heads/${DECKR_REF}"
+            git checkout --detach FETCH_HEAD
+          elif git ls-remote --exit-code origin "refs/tags/${DECKR_REF}" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "refs/tags/${DECKR_REF}"
+            git checkout --detach FETCH_HEAD
+          else
+            echo "Deckr ref '${DECKR_REF}' not found; using checked-out default branch."
+          fi
+          test -f rust/deckr/Cargo.toml
+          echo "Using Deckr $(git rev-parse HEAD)"
+
+      - name: Install system packages
+        run: brew install libusb
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        working-directory: ${{ env.DRIVER_DIR }}
+        run: cargo build --release --target "${{ matrix.target }}"
+
+      - name: Package binary
+        shell: bash
+        working-directory: ${{ env.DRIVER_DIR }}
+        run: |
+          set -euo pipefail
+          package="dist/${{ matrix.archive }}"
+          mkdir -p "${package}"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "${package}/"
+          tar -czf "dist/${{ matrix.archive }}.tar.gz" -C dist "${{ matrix.archive }}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ env.DRIVER_DIR }}/dist/${{ matrix.archive }}.tar.gz
+          retention-days: 14
 
   linux-cross-build:
     name: Build ${{ matrix.target }}
@@ -153,7 +239,7 @@ jobs:
           echo "Using Deckr $(git rev-parse HEAD)"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Install cross
         run: cargo install cross --locked
@@ -253,7 +339,7 @@ jobs:
             zstd
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Build OpenWrt package and binary
         working-directory: ${{ env.DRIVER_DIR }}
@@ -277,6 +363,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - lint-and-test
+      - native-build
       - linux-cross-build
       - openwrt-pi1-build
     permissions:

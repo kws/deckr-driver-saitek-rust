@@ -68,6 +68,8 @@ interface is still required.
 
 ## Build
 
+This crate is built and tested with Rust 1.88.
+
 ```sh
 cargo build
 cargo test
@@ -151,9 +153,9 @@ if the produced binary references glibc, such as `/lib/ld-linux-armhf.so.3` or
 ## GitHub Actions
 
 The build workflow runs formatting, clippy, tests, and release builds for the
-Linux Intel, Raspberry Pi, and OpenWrt Raspberry Pi 1 targets. Pushing a tag
-that starts with `v`, such as `v0.1.0`, packages the binaries and creates or
-updates the matching GitHub Release.
+Linux Intel, Raspberry Pi, macOS, and OpenWrt Raspberry Pi 1 targets. Pushing a
+tag that starts with `v`, such as `v0.1.0`, packages the binaries and creates
+or updates the matching GitHub Release.
 
 The workflow checks out the sibling `kws/deckr` repository because this crate
 uses the local Deckr Rust core path dependency. If the current branch or tag
