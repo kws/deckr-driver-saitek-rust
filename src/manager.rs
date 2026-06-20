@@ -1883,7 +1883,10 @@ mod tests {
         }
         command_tx.send(RuntimeCommand::Stop).unwrap();
 
-        assert!(matches!(command_rx.try_recv().unwrap(), RuntimeCommand::Stop));
+        assert!(matches!(
+            command_rx.try_recv().unwrap(),
+            RuntimeCommand::Stop
+        ));
         assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
