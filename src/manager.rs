@@ -638,9 +638,9 @@ async fn concord_state_watch_loop(
             state.hardware.endpoint().clone()
         };
         let mut stream = match concord
-            .watch_participant_profile_notifications_cached(
-                &manager_endpoint,
+            .watch_contract_notifications_cached(
                 Some(HARDWARE_CLAIM_PROFILE_ID),
+                Some(&manager_endpoint),
             )
             .await
         {
@@ -1593,7 +1593,8 @@ mod tests {
     use crate::protocol::{FipControlPacket, REQ_CLEAR_IMAGE, REQ_PROBE, REQ_SET_IMAGE};
     use deckr::beacon::{find_candidates, DEFAULT_BEACON_TTL_SECONDS};
     use deckr::concord::{
-        ContractHandle, ContractValidityStatus, DEFAULT_CONCORD_TOKEN_TTL_SECONDS,
+        ContractHandle, ContractValidityStatus, CreateContractSpec,
+        DEFAULT_CONCORD_TOKEN_TTL_SECONDS,
     };
     use deckr::hardware::{HardwareClaimRoute, HardwareClaimRouting};
     use deckr::lanes::DeviceRef;
@@ -1811,18 +1812,19 @@ mod tests {
         .unwrap()
         .profile(HARDWARE_CLAIM_PROFILE_ID.to_string());
         let contract = concord
-            .create_contract(
-                vec![controller.clone(), manager.clone()],
-                Some("contract-1".to_string()),
-                1,
-                Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
-                Some(hardware_claim_terms_with_fingerprint(
+            .create_contract(CreateContractSpec {
+                participants: vec![controller.clone(), manager.clone()],
+                contract_id: Some("contract-1".to_string()),
+                generation: 1,
+                profile: Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
+                terms: Some(hardware_claim_terms_with_fingerprint(
                     manager_id,
                     device_id,
                     fingerprint,
                 )),
-                Some(controller.clone()),
-            )
+                created_by: Some(controller.clone()),
+                supersedes: None,
+            })
             .await
             .unwrap();
         concord
@@ -2254,18 +2256,19 @@ mod tests {
 
         let controller = EndpointAddress::parse("controller:main").unwrap();
         let second_contract = concord
-            .create_contract(
-                vec![controller.clone(), manager_endpoint.clone()],
-                Some("contract-2".to_string()),
-                1,
-                Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
-                Some(hardware_claim_terms_with_fingerprint(
+            .create_contract(CreateContractSpec {
+                participants: vec![controller.clone(), manager_endpoint.clone()],
+                contract_id: Some("contract-2".to_string()),
+                generation: 1,
+                profile: Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
+                terms: Some(hardware_claim_terms_with_fingerprint(
                     "saitek-main",
                     "fip",
                     Some("fingerprint:fip"),
                 )),
-                Some(controller.clone()),
-            )
+                created_by: Some(controller.clone()),
+                supersedes: None,
+            })
             .await
             .unwrap();
         concord
