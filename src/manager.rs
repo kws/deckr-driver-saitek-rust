@@ -1259,6 +1259,7 @@ mod tests {
     struct FakeBackend {
         enumerate_rows: Arc<StdMutex<Vec<DeviceCandidate>>>,
         device: Arc<StdMutex<FakeDeviceState>>,
+        open_count: Arc<StdMutex<usize>>,
     }
 
     struct FakeDeviceState {
@@ -1276,7 +1277,12 @@ mod tests {
                     sent_frames: Vec::new(),
                     commands: Vec::new(),
                 })),
+                open_count: Arc::new(StdMutex::new(0)),
             }
+        }
+
+        fn push_report(&self, report: Vec<u8>) {
+            self.device.lock().unwrap().reports.push_back(report);
         }
 
         fn sent_frames(&self) -> Vec<Vec<u8>> {
@@ -1285,6 +1291,10 @@ mod tests {
 
         fn commands(&self) -> Vec<u32> {
             self.device.lock().unwrap().commands.clone()
+        }
+
+        fn open_count(&self) -> usize {
+            *self.open_count.lock().unwrap()
         }
     }
 
@@ -1317,6 +1327,7 @@ mod tests {
             _candidate: &DeviceCandidate,
             _timeout: Duration,
         ) -> Result<Box<dyn DeviceHandle>> {
+            *self.open_count.lock().unwrap() += 1;
             Ok(Box::new(FakeHandle {
                 state: self.device.clone(),
             }))
@@ -1364,7 +1375,11 @@ mod tests {
         }
 
         fn read_hid_report(&mut self, _timeout: Duration) -> Result<Option<Vec<u8>>> {
-            Ok(self.state.lock().unwrap().reports.pop_front())
+            if let Some(report) = self.state.lock().unwrap().reports.pop_front() {
+                return Ok(Some(report));
+            }
+            thread::sleep(_timeout);
+            Ok(None)
         }
     }
 
@@ -1391,6 +1406,15 @@ mod tests {
             command_type: command_type.to_string(),
             params,
         }
+    }
+
+    fn raster_command_for_device(command_type: &str, device_id: &str) -> HardwareMessageBody {
+        let mut body = raster_command(command_type);
+        if let HardwareMessageBody::ControlCommand { device_ref, .. } = &mut body {
+            device_ref.device_id = device_id.to_string();
+            device_ref.fingerprint = Some(device_id.to_string());
+        }
+        body
     }
 
     fn contract_pointer(contract_id: &str) -> ContractPointer {
@@ -1429,6 +1453,61 @@ mod tests {
             ),
             manager_rx,
         )
+    }
+
+    async fn recv_worker_report(
+        worker_rx: &mut tokio_mpsc::UnboundedReceiver<WorkerReport>,
+    ) -> WorkerReport {
+        tokio::time::timeout(Duration::from_secs(3), worker_rx.recv())
+            .await
+            .expect("worker report should arrive")
+            .expect("worker report channel should stay open")
+    }
+
+    async fn recv_worker_event(
+        manager_rx: &mut tokio_mpsc::UnboundedReceiver<WorkerEvent>,
+    ) -> WorkerEvent {
+        tokio::time::timeout(Duration::from_secs(3), manager_rx.recv())
+            .await
+            .expect("worker event should arrive")
+            .expect("worker event channel should stay open")
+    }
+
+    async fn forward_worker_event(h: &ManagedHarness, event: WorkerEvent) {
+        match event {
+            WorkerEvent::Connected {
+                device_id,
+                command_tx,
+                device,
+                ..
+            } => {
+                h.handler
+                    .register_device(device_id.clone(), command_tx)
+                    .await;
+                h.runtime.set_device(device).await.unwrap();
+            }
+            WorkerEvent::Input { body, .. } => {
+                h.runtime.handle_hardware_message(body).await.unwrap();
+            }
+            WorkerEvent::Disconnected { device_id, .. } => {
+                h.handler.remove_device(&device_id).await;
+                h.runtime
+                    .remove_device(&device_id, "disconnected")
+                    .await
+                    .unwrap();
+            }
+            WorkerEvent::Failed { error, .. } => panic!("device worker failed: {error}"),
+        }
+    }
+
+    async fn wait_for_command(backend: &FakeBackend, request: u32) {
+        for _ in 0..100 {
+            if backend.commands().contains(&request) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("fake backend did not record command 0x{request:02x}");
     }
 
     fn assert_next_disconnected(
@@ -1623,6 +1702,97 @@ mod tests {
         let active = supervisor.active_workers.get(&path_key).unwrap();
         assert_eq!(active.worker_id, 2);
         assert_eq!(active.device_id, device_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fake_usb_worker_routes_claimed_input_through_managed_runtime() {
+        let h = managed_harness().await;
+        let tasks = start_managed_runtime(&h).await;
+        let backend = FakeBackend::new();
+        let candidate = sample_candidate();
+        let path_key = candidate.path_key();
+        let device_id = candidate.hardware_id();
+        let (worker_tx, worker_rx) = tokio_mpsc::unbounded_channel::<WorkerReport>();
+        let (manager_tx, mut manager_rx) = tokio_mpsc::unbounded_channel::<WorkerEvent>();
+        let mut supervisor = Supervisor::new(
+            "saitek-main".to_string(),
+            Arc::new(backend.clone()),
+            worker_tx,
+            worker_rx,
+            manager_tx,
+        );
+
+        supervisor.reconcile_usb_presence(vec![candidate]);
+        let report = recv_worker_report(&mut supervisor.worker_rx).await;
+        supervisor.handle_worker_report(report);
+        let connected = recv_worker_event(&mut manager_rx).await;
+        match &connected {
+            WorkerEvent::Connected {
+                path_key: actual_path,
+                device_id: actual_device,
+                ..
+            } => {
+                assert_eq!(actual_path, &path_key);
+                assert_eq!(actual_device, &device_id);
+            }
+            other => panic!("expected connected worker event, got {other:?}"),
+        }
+        forward_worker_event(&h, connected).await;
+        assert_eq!(backend.open_count(), 1);
+        assert_eq!(backend.commands(), [REQ_PROBE]);
+
+        create_claim(&h.concord, "claim-a", &device_id, Some(&device_id)).await;
+        h.lane.publish_inbound(
+            DeckrMessage::hardware_command(
+                "main",
+                "controller-session",
+                "saitek-main",
+                "manager-session",
+                &device_id,
+                contract_pointer("claim-a"),
+                raster_command_for_device("set_frame", &device_id),
+            )
+            .unwrap(),
+        );
+        wait_for_command(&backend, REQ_SET_IMAGE).await;
+        assert_eq!(backend.open_count(), 1);
+        assert_eq!(backend.sent_frames()[0].len(), crate::protocol::FRAME_BYTES);
+
+        backend.push_report(vec![0x01, 0x00]);
+        let report = recv_worker_report(&mut supervisor.worker_rx).await;
+        supervisor.handle_worker_report(report);
+        let input = recv_worker_event(&mut manager_rx).await;
+        forward_worker_event(&h, input).await;
+
+        let published = wait_for_published(&h, 1).await;
+        let routed = published.last().unwrap();
+        assert_eq!(routed.recipient_endpoint(), Some("controller:main"));
+        assert_eq!(
+            routed.recipient_session_id.as_deref(),
+            Some("controller-session")
+        );
+        assert_eq!(routed.contract.as_ref(), Some(&contract_pointer("claim-a")));
+        match routed.hardware_body().unwrap() {
+            HardwareMessageBody::ControlInput {
+                device_ref,
+                control_id,
+                capability_id,
+                event_type,
+                value,
+                ..
+            } => {
+                assert_eq!(device_ref.device_id, device_id);
+                assert_eq!(device_ref.fingerprint.as_deref(), Some(device_id.as_str()));
+                assert_eq!(control_id, "s1");
+                assert_eq!(capability_id, "button.momentary");
+                assert_eq!(event_type, "down");
+                assert_eq!(value, Some(serde_json::json!({"eventType": "down"})));
+            }
+            other => panic!("expected routed control input, got {other:?}"),
+        }
+
+        supervisor.stop_all_workers();
+        stop_managed_runtime(&h, tasks).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
