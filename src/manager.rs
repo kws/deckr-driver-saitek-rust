@@ -1058,6 +1058,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::{FipControlPacket, REQ_CLEAR_IMAGE, REQ_PROBE, REQ_SET_IMAGE};
+    use deckr::authority::ContractPointer;
     use deckr::concord::{ConcordCoordinator, ContractHandle, ContractState, CreateContractSpec};
     use deckr::endpoint::{hardware_manager_address, EndpointAddress};
     use deckr::hardware::runtime::{
@@ -1392,6 +1393,13 @@ mod tests {
         }
     }
 
+    fn contract_pointer(contract_id: &str) -> ContractPointer {
+        ContractPointer {
+            contract_id: contract_id.to_string(),
+            generation: 1,
+        }
+    }
+
     fn make_png() -> Vec<u8> {
         use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
         use std::io::Cursor;
@@ -1638,6 +1646,7 @@ mod tests {
                 "saitek-main",
                 "manager-session",
                 "fip",
+                contract_pointer("claim-a"),
                 raster_command("set_frame"),
             )
             .unwrap(),
@@ -1660,6 +1669,7 @@ mod tests {
                 "saitek-main",
                 "manager-session",
                 "fip",
+                contract_pointer("claim-a"),
                 raster_command("set_frame"),
             )
             .unwrap(),
@@ -1701,6 +1711,7 @@ mod tests {
                 "saitek-main",
                 "manager-session",
                 "fip",
+                contract_pointer("claim-a"),
                 raster_command("set_frame"),
             )
             .unwrap(),
@@ -1721,6 +1732,7 @@ mod tests {
                 "saitek-main",
                 "manager-session",
                 "fip",
+                contract_pointer("claim-a"),
                 raster_command("unsupported"),
             )
             .unwrap(),
@@ -1756,6 +1768,7 @@ mod tests {
                 "saitek-main",
                 "manager-session",
                 "fip",
+                contract_pointer("claim-a"),
                 raster_command("set_frame"),
             )
             .unwrap(),
@@ -1787,6 +1800,7 @@ mod tests {
                 "saitek-main",
                 "manager-session",
                 "fip",
+                contract_pointer("claim-b"),
                 raster_command("set_frame"),
             )
             .unwrap(),
