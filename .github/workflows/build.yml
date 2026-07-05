@@ -46,7 +46,7 @@ jobs:
         shell: bash
         working-directory: deckr
         env:
-          DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
+          DECKR_REF: fd499b62fd4ebd6b27bbfaa55a1dd91892686889
         run: |
           set -euo pipefail
           if [[ "${DECKR_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
@@ -123,7 +123,7 @@ jobs:
         shell: bash
         working-directory: deckr
         env:
-          DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
+          DECKR_REF: fd499b62fd4ebd6b27bbfaa55a1dd91892686889
         run: |
           set -euo pipefail
           if [[ "${DECKR_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
@@ -220,7 +220,7 @@ jobs:
         shell: bash
         working-directory: deckr
         env:
-          DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
+          DECKR_REF: fd499b62fd4ebd6b27bbfaa55a1dd91892686889
         run: |
           set -euo pipefail
           if [[ "${DECKR_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
@@ -292,7 +292,7 @@ jobs:
         shell: bash
         working-directory: deckr
         env:
-          DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
+          DECKR_REF: fd499b62fd4ebd6b27bbfaa55a1dd91892686889
         run: |
           set -euo pipefail
           if [[ "${DECKR_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
