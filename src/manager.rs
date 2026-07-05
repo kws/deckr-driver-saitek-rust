@@ -1053,7 +1053,6 @@ fn apply_runtime_command(handle: &mut dyn DeviceHandle, command: RuntimeCommand)
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
-    use std::future::Future;
     use std::sync::{Arc, Mutex as StdMutex};
 
     use super::*;
@@ -1108,29 +1107,22 @@ mod tests {
     }
 
     impl HardwareLaneTransport for TestHardwareLane {
-        fn publish_hardware_message(
-            &self,
-            message: DeckrMessage,
-        ) -> impl Future<Output = deckr::Result<()>> + Send + '_ {
-            async move {
-                self.published.lock().await.push(message);
-                Ok(())
-            }
+        async fn publish_hardware_message(&self, message: DeckrMessage) -> deckr::Result<()> {
+            self.published.lock().await.push(message);
+            Ok(())
         }
 
-        fn subscribe_hardware_messages<'a>(
+        async fn subscribe_hardware_messages<'a>(
             &'a self,
             _endpoint: &'a EndpointAddress,
-        ) -> impl Future<Output = deckr::Result<HardwareMessageStream>> + Send + 'a {
-            async move {
-                let rx = self.inbound_rx.lock().await.take().ok_or_else(|| {
-                    deckr::Error::Invalid("test hardware lane already subscribed".to_string())
-                })?;
-                let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-                    rx.recv().await.map(|message| (Ok(message), rx))
-                });
-                Ok(Box::pin(stream) as HardwareMessageStream)
-            }
+        ) -> deckr::Result<HardwareMessageStream> {
+            let rx = self.inbound_rx.lock().await.take().ok_or_else(|| {
+                deckr::Error::Invalid("test hardware lane already subscribed".to_string())
+            })?;
+            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|message| (Ok(message), rx))
+            });
+            Ok(Box::pin(stream) as HardwareMessageStream)
         }
     }
 
