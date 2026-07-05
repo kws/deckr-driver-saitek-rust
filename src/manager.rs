@@ -1152,7 +1152,7 @@ mod tests {
             maintenance_policy: StateMaintenancePolicy {
                 renewal_interval: Duration::from_secs(3600),
                 concord_token_refresh_interval: Duration::from_secs(3600),
-                reconcile_interval: Duration::from_secs(3600),
+                reconcile_interval: Duration::from_millis(20),
             },
             command_handler: handler.clone(),
             reset_handler: Some(handler.clone()),
@@ -1216,8 +1216,18 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        contract
+        for _ in 0..100 {
+            if concord
+                .participant_token(&contract, &manager_endpoint())
+                .await
+                .unwrap()
+                .is_some()
+            {
+                return contract;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("manager token was not attached for {contract_id}");
     }
 
     async fn start_managed_runtime(h: &ManagedHarness) -> JoinSet<deckr::Result<()>> {
@@ -1241,6 +1251,32 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("hardware lane did not publish {count} messages");
+    }
+
+    async fn wait_for_command_rejection_after(
+        h: &ManagedHarness,
+        after_count: usize,
+        expected_reason: &str,
+        expected_message: &str,
+    ) {
+        for _ in 0..100 {
+            let published = h.lane.published().await;
+            if published.iter().skip(after_count).any(|published_message| {
+                matches!(
+                    published_message.hardware_body(),
+                    Ok(HardwareMessageBody::CommandRejected {
+                        reason,
+                        message,
+                        ..
+                    }) if reason == expected_reason
+                        && message.as_deref() == Some(expected_message)
+                )
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("hardware lane did not publish {expected_reason} rejection");
     }
 
     fn test_device_descriptor(device_id: &str, fingerprint: &str) -> DeviceDescriptor {
@@ -1866,6 +1902,7 @@ mod tests {
             .unwrap();
         create_claim(&h.concord, "claim-a", "fip", Some("fingerprint:fip")).await;
 
+        let published_before = h.lane.published().await.len();
         h.lane.publish_inbound(
             DeckrMessage::hardware_command(
                 "other",
@@ -1878,15 +1915,16 @@ mod tests {
             )
             .unwrap(),
         );
+        wait_for_command_rejection_after(
+            &h,
+            published_before,
+            "unauthorized",
+            "Hardware command unauthorized",
+        )
+        .await;
         assert!(command_rx.try_recv().is_err());
-        let published = wait_for_published(&h, 1).await;
-        assert!(matches!(
-            published.last().unwrap().hardware_body().unwrap(),
-            HardwareMessageBody::CommandRejected { ref reason, ref message, .. }
-                if reason == "unauthorized"
-                    && message.as_deref() == Some("Hardware command unauthorized")
-        ));
 
+        let published_before = h.lane.published().await.len();
         h.lane.publish_inbound(
             DeckrMessage::hardware_command(
                 "main",
@@ -1899,13 +1937,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let published = wait_for_published(&h, 2).await;
-        assert!(matches!(
-            published.last().unwrap().hardware_body().unwrap(),
-            HardwareMessageBody::CommandRejected { ref reason, ref message, .. }
-                if reason == "unsupported"
-                    && message.as_deref() == Some("Hardware command unsupported")
-        ));
+        wait_for_command_rejection_after(
+            &h,
+            published_before,
+            "unsupported",
+            "Hardware command unsupported",
+        )
+        .await;
 
         stop_managed_runtime(&h, tasks).await;
     }
