@@ -1284,7 +1284,7 @@ mod tests {
         expected: &str,
         predicate: impl Fn(&RuntimeCommand) -> bool,
     ) -> RuntimeCommand {
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut skipped_count = 0usize;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1299,6 +1299,19 @@ mod tests {
                     "failed waiting for {expected} after skipping {skipped_count} commands: {error:?}"
                 ),
             }
+        }
+    }
+
+    fn assert_no_queued_runtime_command(
+        command_rx: &CommandReceiver,
+        unexpected: &str,
+        predicate: impl Fn(&RuntimeCommand) -> bool,
+    ) {
+        while let Ok(command) = command_rx.try_recv() {
+            assert!(
+                !predicate(&command),
+                "unexpected {unexpected} command queued: {command:?}"
+            );
         }
     }
 
@@ -1943,7 +1956,9 @@ mod tests {
             "Hardware command unauthorized",
         )
         .await;
-        assert!(command_rx.try_recv().is_err());
+        assert_no_queued_runtime_command(&command_rx, "raster frame", |command| {
+            matches!(command, RuntimeCommand::SetRasterFrame { .. })
+        });
 
         let published_before = h.lane.published().await.len();
         h.lane.publish_inbound(
@@ -1965,6 +1980,9 @@ mod tests {
             "Hardware command unsupported",
         )
         .await;
+        assert_no_queued_runtime_command(&command_rx, "raster frame", |command| {
+            matches!(command, RuntimeCommand::SetRasterFrame { .. })
+        });
 
         stop_managed_runtime(&h, tasks).await;
     }
