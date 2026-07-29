@@ -31,12 +31,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: ${{ env.DRIVER_DIR }}
 
       - name: Check out Deckr dependency
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.DECKR_REPOSITORY }}
           path: deckr
@@ -108,12 +108,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: ${{ env.DRIVER_DIR }}
 
       - name: Check out Deckr dependency
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.DECKR_REPOSITORY }}
           path: deckr
@@ -205,12 +205,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: ${{ env.DRIVER_DIR }}
 
       - name: Check out Deckr dependency
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.DECKR_REPOSITORY }}
           path: deckr
@@ -277,12 +277,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: ${{ env.DRIVER_DIR }}
 
       - name: Check out Deckr dependency
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.DECKR_REPOSITORY }}
           path: deckr
