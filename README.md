@@ -88,6 +88,26 @@ Environment variables:
 - `DECKR_MANAGER_ID` (optional; overrides the `saitek-rust-<hostname>` default)
 - `DECKR_NATS_URL`
 - `DECKR_STATE_RECONCILE_SECONDS` (optional; defaults to `300`)
+- `DECKR_FRAME_TIMEOUT_SECONDS` (optional; defaults to `30`)
+
+### Frame freshness
+
+`--frame-timeout-seconds` / `DECKR_FRAME_TIMEOUT_SECONDS` sets a positive whole
+number of seconds (default `30`) without a successfully authorized and displayed
+frame before the manager replaces the screen with **STREAM LOST / WAITING FOR
+FRAMES**. The timeout also applies while waiting for the first frame after USB
+startup. The notice is drawn once; the next valid frame automatically replaces it.
+Lamp commands, rejected frames and claim resets do not extend the deadline.
+An explicit authorized raster `clear` intentionally blanks the screen and
+disarms this notice until another valid frame is displayed. Shutdown still clears
+the device and exits normally.
+
+This is a local display diagnostic, not lifecycle or availability authority:
+Concord ownership, cancellation and participant-token rules remain unchanged.
+Controllers should send a cached frame heartbeat more often than this timeout;
+ATC defaults to `frame_heartbeat_seconds = 15.0`. A heartbeat does not advance the
+cached image's timestamp. Configure either value in the service's arguments or
+environment / controller TOML, then restart that service; no rebuild is needed.
 
 Concord participant-token renewal timing is managed by the Rust core.
 

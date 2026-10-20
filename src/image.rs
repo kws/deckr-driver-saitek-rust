@@ -33,6 +33,52 @@ pub fn encoded_image_to_fip_frame(image: &[u8]) -> Result<Vec<u8>> {
     )
 }
 
+/// Manager-local notice: never leave an old radar image looking live.
+pub fn make_stream_lost_frame() -> Result<Vec<u8>> {
+    let mut rgb = vec![0u8; FRAME_BYTES];
+    draw_notice_line(&mut rgb, "STREAM LOST", 88, 4, [255, 170, 40]);
+    draw_notice_line(&mut rgb, "WAITING FOR FRAMES", 144, 2, [200, 200, 200]);
+    frame_from_top_down_rgb_bytes(&rgb, DEFAULT_CHANNEL_ORDER, DEFAULT_ROW_ORDER)
+}
+
+fn draw_notice_line(rgb: &mut [u8], text: &str, top: usize, scale: usize, color: [u8; 3]) {
+    let left = (WIDTH - (text.len() * 6 - 1) * scale) / 2;
+    for (index, letter) in text.bytes().enumerate() {
+        // A small fixed font keeps the USB fallback independent of host fonts.
+        let rows = match letter {
+            b'A' => [14, 17, 17, 31, 17, 17, 17],
+            b'E' => [31, 16, 16, 30, 16, 16, 31],
+            b'F' => [31, 16, 16, 30, 16, 16, 16],
+            b'G' => [14, 17, 16, 23, 17, 17, 14],
+            b'I' => [31, 4, 4, 4, 4, 4, 31],
+            b'L' => [16, 16, 16, 16, 16, 16, 31],
+            b'M' => [17, 27, 21, 21, 17, 17, 17],
+            b'N' => [17, 25, 25, 21, 19, 19, 17],
+            b'O' => [14, 17, 17, 17, 17, 17, 14],
+            b'R' => [30, 17, 17, 30, 20, 18, 17],
+            b'S' => [15, 16, 16, 14, 1, 1, 30],
+            b'T' => [31, 4, 4, 4, 4, 4, 4],
+            b'W' => [17, 17, 17, 21, 21, 27, 17],
+            _ => [0; 7],
+        };
+        for (y, row) in rows.iter().enumerate() {
+            for x in 0..5 {
+                if row & (1 << (4 - x)) == 0 {
+                    continue;
+                }
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let offset =
+                            ((top + y * scale + dy) * WIDTH + left + (index * 6 + x) * scale + dx)
+                                * BYTES_PER_PIXEL;
+                        rgb[offset..offset + 3].copy_from_slice(&color);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn make_quadrant_frame(channel_order: ChannelOrder, row_order: RowOrder) -> Result<Vec<u8>> {
     let mut top_down_rgb = vec![0u8; FRAME_BYTES];
 

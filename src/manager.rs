@@ -7,9 +7,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::thread;
-use std::time::Duration;
-#[cfg(test)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
@@ -33,7 +31,7 @@ use crate::descriptor::{
     device_descriptor, led_index, translate_hid_event, DEFAULT_PAGE_ID, LED_CAPABILITY_ID,
     RASTER_CAPABILITY_ID, SCREEN_CONTROL_ID,
 };
-use crate::image::encoded_image_to_fip_frame;
+use crate::image::{encoded_image_to_fip_frame, make_stream_lost_frame};
 use crate::protocol::{changed_events, decode_hid_mask, ByteOrder};
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
@@ -43,6 +41,77 @@ const MAX_BACKOFF_SECS: u64 = 10;
 const COMMAND_QUEUE_CAPACITY: usize = 32;
 const OUTPUT_BATCH_SIZE: usize = 4;
 const BUSY_READ_TIMEOUT: Duration = Duration::from_millis(1);
+const DEFAULT_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct WorkerSettings {
+    manager_id: String,
+    frame_timeout: Duration,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DisplayEffect {
+    None,
+    Frame,
+    Clear,
+    Reset,
+}
+
+// Local display freshness only; this never changes Concord authority or replays
+// an old controller frame. Explicit clear intentionally leaves a blank display.
+struct FrameWatchdog {
+    timeout: Duration,
+    last_frame: Option<Instant>,
+    notice_shown: bool,
+}
+
+impl FrameWatchdog {
+    fn new(timeout: Duration, now: Instant) -> Self {
+        Self {
+            timeout,
+            last_frame: Some(now),
+            notice_shown: false,
+        }
+    }
+
+    fn observe(&mut self, effect: DisplayEffect, now: Instant) {
+        match effect {
+            DisplayEffect::Frame => {
+                if self.notice_shown {
+                    info!("Frame stream resumed");
+                }
+                self.last_frame = Some(now);
+                self.notice_shown = false;
+            }
+            DisplayEffect::Clear => {
+                self.last_frame = None;
+                self.notice_shown = false;
+            }
+            DisplayEffect::Reset => {
+                // Reset clears the screen immediately. Preserve the last frame's
+                // deadline so repeated claim changes cannot conceal a lost stream.
+                self.notice_shown = false;
+            }
+            DisplayEffect::None => {}
+        }
+    }
+
+    fn check(&mut self, handle: &mut dyn DeviceHandle, now: Instant) -> Result<()> {
+        if !self.notice_shown
+            && self
+                .last_frame
+                .is_some_and(|last| now.duration_since(last) >= self.timeout)
+        {
+            handle.send_image(&make_stream_lost_frame()?, DEFAULT_PAGE_ID)?;
+            self.notice_shown = true;
+            warn!(
+                timeout_seconds = self.timeout.as_secs_f64(),
+                "Frame stream lost; STREAM LOST displayed"
+            );
+        }
+        Ok(())
+    }
+}
 
 type ManagedNatsHardwareRuntime =
     ManagedHardwareRuntime<NatsStateStore, NatsStateStore, NatsStateStore, NatsDeckrRuntime>;
@@ -433,6 +502,7 @@ pub struct SaitekRemoteManager {
     session_id: String,
     backend: Arc<dyn Backend>,
     state_policy: StateMaintenancePolicy,
+    frame_timeout: Duration,
 }
 
 impl SaitekRemoteManager {
@@ -466,11 +536,21 @@ impl SaitekRemoteManager {
             session_id: Uuid::new_v4().to_string(),
             backend,
             state_policy,
+            frame_timeout: DEFAULT_FRAME_TIMEOUT,
         }
     }
 
     pub async fn run(&self) -> Result<()> {
         self.run_until(shutdown_signal()).await
+    }
+
+    pub fn with_frame_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "frame timeout must be greater than zero"
+        );
+        self.frame_timeout = timeout;
+        self
     }
 
     async fn run_until(&self, signal: impl Future<Output = Result<()>>) -> Result<()> {
@@ -548,13 +628,14 @@ impl SaitekRemoteManager {
         let (supervisor_event_tx, supervisor_event_rx) = tokio_mpsc::unbounded_channel();
         let (manager_event_tx, manager_event_rx) = tokio_mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let supervisor = Supervisor::new(
+        let mut supervisor = Supervisor::new(
             self.manager_id.clone(),
             self.backend.clone(),
             supervisor_event_tx,
             supervisor_event_rx,
             manager_event_tx,
         );
+        supervisor.frame_timeout = self.frame_timeout;
         let mut supervisor_handle = tokio::spawn(supervisor.run(shutdown_rx));
         let mut tasks = JoinSet::<Result<()>>::new();
         tasks.spawn(worker_event_loop(
@@ -782,6 +863,7 @@ struct Supervisor {
     launched_workers: HashMap<String, LaunchedWorker>,
     active_workers: HashMap<String, ActiveWorker>,
     workers: Vec<OwnedWorker>,
+    frame_timeout: Duration,
 }
 
 struct OwnedWorker {
@@ -822,6 +904,7 @@ impl Supervisor {
             launched_workers: HashMap::new(),
             active_workers: HashMap::new(),
             workers: Vec::new(),
+            frame_timeout: DEFAULT_FRAME_TIMEOUT,
         }
     }
 
@@ -915,7 +998,10 @@ impl Supervisor {
             let worker_sender = command_tx.clone();
             let thread = spawn_device_worker(
                 worker_id,
-                self.manager_id.clone(),
+                WorkerSettings {
+                    manager_id: self.manager_id.clone(),
+                    frame_timeout: self.frame_timeout,
+                },
                 self.backend.clone(),
                 descriptor,
                 self.worker_tx.clone(),
@@ -1103,7 +1189,7 @@ async fn enumerate_canonical(backend: Arc<dyn Backend>) -> Result<Vec<DeviceCand
 
 fn spawn_device_worker(
     worker_id: u64,
-    manager_id: String,
+    settings: WorkerSettings,
     backend: Arc<dyn Backend>,
     descriptor: DeviceCandidate,
     worker_tx: tokio_mpsc::UnboundedSender<WorkerReport>,
@@ -1116,7 +1202,7 @@ fn spawn_device_worker(
         let report = match device_worker(
             backend,
             worker_id,
-            manager_id,
+            settings,
             descriptor,
             worker_tx.clone(),
             command_tx,
@@ -1140,7 +1226,7 @@ fn spawn_device_worker(
 fn device_worker(
     backend: Arc<dyn Backend>,
     worker_id: u64,
-    manager_id: String,
+    settings: WorkerSettings,
     descriptor: DeviceCandidate,
     worker_tx: tokio_mpsc::UnboundedSender<WorkerReport>,
     command_tx: CommandSender,
@@ -1180,6 +1266,7 @@ fn device_worker(
     }
 
     let mut previous_mask = 0u16;
+    let mut watchdog = FrameWatchdog::new(settings.frame_timeout, Instant::now());
     loop {
         let mut outputs = 0;
         for _ in 0..OUTPUT_BATCH_SIZE {
@@ -1189,13 +1276,15 @@ fn device_worker(
                 }
                 Ok(command) => {
                     // The wrapper reports one Failed transition, preserving its cause.
-                    apply_runtime_command(&mut *handle, command)?;
+                    let effect = apply_runtime_command(&mut *handle, command)?;
+                    watchdog.observe(effect, Instant::now());
                     outputs += 1;
                 }
                 Err(TryRecvError::Empty) => break,
             }
         }
 
+        watchdog.check(&mut *handle, Instant::now())?;
         let read_timeout = if outputs > 0 {
             BUSY_READ_TIMEOUT
         } else {
@@ -1214,7 +1303,7 @@ fn device_worker(
         let mask = decode_hid_mask(&report, 0, ByteOrder::Big)?;
         for event in changed_events(previous_mask, mask) {
             if let Some(body) =
-                translate_hid_event(event, &manager_id, &local_device_id, &fingerprint)
+                translate_hid_event(event, &settings.manager_id, &local_device_id, &fingerprint)
             {
                 let _ = worker_tx.send(WorkerReport::Input {
                     worker_id,
@@ -1228,17 +1317,20 @@ fn device_worker(
     }
 }
 
-fn apply_runtime_command(handle: &mut dyn DeviceHandle, command: RuntimeCommand) -> Result<()> {
+fn apply_runtime_command(
+    handle: &mut dyn DeviceHandle,
+    command: RuntimeCommand,
+) -> Result<DisplayEffect> {
     match command {
         RuntimeCommand::Hardware(AuthorizedOutput { output, context }) => {
-            apply_hardware_output(handle, output, || context.authorize())?;
+            apply_hardware_output(handle, output, || context.authorize())
         }
         RuntimeCommand::ResetDevice => {
             reset_device(handle)?;
+            Ok(DisplayEffect::Reset)
         }
-        RuntimeCommand::Stop => {}
+        RuntimeCommand::Stop => Ok(DisplayEffect::None),
     }
-    Ok(())
 }
 
 fn clear_leds(handle: &mut dyn DeviceHandle) -> Result<()> {
@@ -1261,17 +1353,18 @@ fn apply_hardware_output(
     handle: &mut dyn DeviceHandle,
     output: HardwareOutput,
     mut authorize: impl FnMut() -> deckr::Result<()>,
-) -> Result<()> {
+) -> Result<DisplayEffect> {
     // Authority loss discards this command; it is not a USB failure.
     if let Err(error) = authorize() {
         debug!(%error, "discarding hardware command without current authority");
-        return Ok(());
+        return Ok(DisplayEffect::None);
     }
     match output {
         HardwareOutput::SetLed { control_id, on } => {
             let index = led_index(&control_id).context("unknown LED control")?;
             handle.set_led(DEFAULT_PAGE_ID, index, on)?;
             tracing::trace!(%control_id, on, "USB lamp output completed");
+            Ok(DisplayEffect::None)
         }
         HardwareOutput::SetRasterFrame {
             control_id,
@@ -1280,7 +1373,7 @@ fn apply_hardware_output(
         } => {
             if control_id != SCREEN_CONTROL_ID {
                 warn!("Ignoring raster set_frame for unknown control {control_id}");
-                return Ok(());
+                return Ok(DisplayEffect::None);
             }
             if !matches!(encoding.as_str(), "jpeg" | "png") {
                 bail!("unsupported raster encoding {encoding}");
@@ -1288,21 +1381,22 @@ fn apply_hardware_output(
             let frame = encoded_image_to_fip_frame(&image)?;
             if let Err(error) = authorize() {
                 debug!(%error, "discarding raster frame after authority loss during conversion");
-                return Ok(());
+                return Ok(DisplayEffect::None);
             }
             handle.send_image(&frame, DEFAULT_PAGE_ID)?;
             tracing::trace!(%control_id, "USB raster frame completed");
+            Ok(DisplayEffect::Frame)
         }
         HardwareOutput::ClearRaster { control_id } => {
             if control_id != SCREEN_CONTROL_ID {
                 warn!("Ignoring raster clear for unknown control {control_id}");
-                return Ok(());
+                return Ok(DisplayEffect::None);
             }
             handle.clear_image(DEFAULT_PAGE_ID)?;
             tracing::trace!(%control_id, "USB raster clear completed");
+            Ok(DisplayEffect::Clear)
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2581,7 +2675,7 @@ mod tests {
             state: backend.device.clone(),
         };
         let mut checks = 0;
-        apply_hardware_output(
+        let effect = apply_hardware_output(
             &mut handle,
             hardware_output_from_body(raster_command("set_frame")).unwrap(),
             || {
@@ -2597,6 +2691,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(checks, 2);
+        assert_eq!(effect, DisplayEffect::None);
         assert!(backend.commands().is_empty());
     }
 
@@ -2606,7 +2701,7 @@ mod tests {
         let mut handle = FakeHandle {
             state: backend.device.clone(),
         };
-        apply_hardware_output(
+        let effect = apply_hardware_output(
             &mut handle,
             HardwareOutput::SetRasterFrame {
                 control_id: SCREEN_CONTROL_ID.into(),
@@ -2616,6 +2711,7 @@ mod tests {
             || Err(deckr::Error::Unauthorized("claim ended in queue".into())),
         )
         .unwrap();
+        assert_eq!(effect, DisplayEffect::None);
         assert!(backend.commands().is_empty());
     }
 
@@ -2674,7 +2770,7 @@ mod tests {
             state: backend.device.clone(),
         };
 
-        apply_hardware_output(
+        let effect = apply_hardware_output(
             &mut handle,
             HardwareOutput::SetRasterFrame {
                 control_id: SCREEN_CONTROL_ID.to_string(),
@@ -2685,8 +2781,99 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(effect, DisplayEffect::Frame);
+
         assert_eq!(backend.commands(), [REQ_SET_IMAGE]);
         assert_eq!(backend.sent_frames()[0].len(), crate::protocol::FRAME_BYTES);
+    }
+
+    #[test]
+    fn frame_timeout_shows_notice_once_and_valid_frame_recovers() {
+        for seconds in [3, 30] {
+            let backend = FakeBackend::new();
+            let mut handle = FakeHandle {
+                state: backend.device.clone(),
+            };
+            let start = Instant::now();
+            let timeout = Duration::from_secs(seconds);
+            let mut watchdog = FrameWatchdog::new(timeout, start);
+            watchdog
+                .check(&mut handle, start + timeout - Duration::from_millis(1))
+                .unwrap();
+            assert!(backend.sent_frames().is_empty());
+            watchdog.check(&mut handle, start + timeout).unwrap();
+            watchdog.check(&mut handle, start + timeout * 2).unwrap();
+            assert_eq!(backend.sent_frames(), [make_stream_lost_frame().unwrap()]);
+            let effect = apply_hardware_output(
+                &mut handle,
+                hardware_output_from_body(raster_command("set_frame")).unwrap(),
+                || Ok(()),
+            )
+            .unwrap();
+            watchdog.observe(effect, start + timeout * 2);
+            assert!(!watchdog.notice_shown);
+            watchdog
+                .check(&mut handle, start + timeout * 3 - Duration::from_millis(1))
+                .unwrap();
+            assert_eq!(backend.sent_frames().len(), 2);
+            watchdog.check(&mut handle, start + timeout * 3).unwrap();
+            assert_eq!(backend.sent_frames().len(), 3);
+        }
+    }
+
+    #[test]
+    fn lamp_output_and_authority_resets_do_not_postpone_frame_timeout() {
+        let backend = FakeBackend::new();
+        let mut handle = FakeHandle {
+            state: backend.device.clone(),
+        };
+        let start = Instant::now();
+        let mut watchdog = FrameWatchdog::new(DEFAULT_FRAME_TIMEOUT, start);
+        watchdog.observe(DisplayEffect::Frame, start);
+        let later = start + Duration::from_secs(29);
+        let effect = apply_hardware_output(
+            &mut handle,
+            HardwareOutput::SetLed {
+                control_id: "s1".into(),
+                on: true,
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        watchdog.observe(effect, later);
+        let effect = apply_runtime_command(&mut handle, RuntimeCommand::ResetDevice).unwrap();
+        watchdog.observe(effect, later);
+        watchdog
+            .check(&mut handle, start + DEFAULT_FRAME_TIMEOUT)
+            .unwrap();
+        assert_eq!(backend.sent_frames(), [make_stream_lost_frame().unwrap()]);
+    }
+
+    #[test]
+    fn intentional_clear_disarms_notice_until_next_valid_frame() {
+        let backend = FakeBackend::new();
+        let mut handle = FakeHandle {
+            state: backend.device.clone(),
+        };
+        let start = Instant::now();
+        let mut watchdog = FrameWatchdog::new(DEFAULT_FRAME_TIMEOUT, start);
+        let effect = apply_hardware_output(
+            &mut handle,
+            hardware_output_from_body(raster_command("clear")).unwrap(),
+            || Ok(()),
+        )
+        .unwrap();
+        watchdog.observe(effect, start);
+        watchdog.observe(DisplayEffect::Reset, start);
+        watchdog
+            .check(&mut handle, start + DEFAULT_FRAME_TIMEOUT * 2)
+            .unwrap();
+        assert!(backend.sent_frames().is_empty());
+        watchdog.observe(DisplayEffect::Frame, start + DEFAULT_FRAME_TIMEOUT * 2);
+        watchdog
+            .check(&mut handle, start + DEFAULT_FRAME_TIMEOUT * 3)
+            .unwrap();
+        assert_eq!(backend.sent_frames().len(), 1);
     }
     struct EnumerationFailure;
     impl Backend for EnumerationFailure {
@@ -2814,7 +3001,10 @@ mod tests {
             device_worker(
                 backend,
                 1,
-                "saitek-main".into(),
+                WorkerSettings {
+                    manager_id: "saitek-main".into(),
+                    frame_timeout: DEFAULT_FRAME_TIMEOUT,
+                },
                 sample_candidate(),
                 reports,
                 sender,
@@ -2949,7 +3139,10 @@ mod tests {
         let (reports, mut report_rx) = tokio_mpsc::unbounded_channel();
         let worker = spawn_device_worker(
             7,
-            "saitek-main".into(),
+            WorkerSettings {
+                manager_id: "saitek-main".into(),
+                frame_timeout: DEFAULT_FRAME_TIMEOUT,
+            },
             backend,
             sample_candidate(),
             reports,

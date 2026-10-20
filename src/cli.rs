@@ -26,6 +26,14 @@ pub struct Args {
     pub manager_id: String,
     #[arg(long, default_value = "info")]
     pub log_level: String,
+    #[arg(
+        long,
+        env = "DECKR_FRAME_TIMEOUT_SECONDS",
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Show STREAM LOST after this many seconds without a usable frame"
+    )]
+    pub frame_timeout_seconds: u64,
 }
 
 impl Args {
@@ -101,6 +109,24 @@ fn normalize_manager_id_part(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_timeout_is_configurable_and_positive() {
+        assert_eq!(
+            Args::try_parse_from(["manager"])
+                .unwrap()
+                .frame_timeout_seconds,
+            30
+        );
+        assert_eq!(
+            Args::try_parse_from(["manager", "--frame-timeout-seconds", "12"])
+                .unwrap()
+                .frame_timeout_seconds,
+            12
+        );
+        assert!(Args::try_parse_from(["manager", "--frame-timeout-seconds", "0"]).is_err());
+        assert!(Args::try_parse_from(["manager", "--frame-timeout-seconds", "-1"]).is_err());
+    }
 
     #[test]
     fn default_manager_id_uses_rust_prefix_and_hostname() {
