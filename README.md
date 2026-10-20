@@ -28,7 +28,11 @@ The manager participates as `hardware_manager:<manager-id>` on the
 `hardware_messages` lane. By default it uses `saitek-rust-<hostname>`.
 Hardware discovery candidates are advertised through Beacon. After a controller
 claim is negotiated, device command/input routing is fenced only by valid
-Concord hardware-claim contracts and participant tokens.
+Concord hardware-claim contracts and participant tokens. Queued display commands
+retain the core authorization context and recheck it before execution and after
+image conversion, immediately before USB output. Commands whose claim, device
+identity, session, or deadline is no longer valid are discarded without
+disconnecting the device. Local reset and stop commands still clear the screen.
 
 ```sh
 deckr-saitek-manager \
@@ -68,7 +72,12 @@ interface is still required.
 
 ## Build
 
-This crate is built and tested with Rust 1.88.
+This crate is built and tested with Rust 1.88. Check out the Rust core alongside
+this repository so its path dependency resolves to `../deckr-core-rust`:
+
+```sh
+git clone https://github.com/kws/deckr-core-rust.git ../deckr-core-rust
+```
 
 ```sh
 cargo build
@@ -157,18 +166,18 @@ Linux Intel, Raspberry Pi, macOS, and OpenWrt Raspberry Pi 1 targets. Pushing a
 tag that starts with `v`, such as `v0.1.0`, packages the binaries and creates
 or updates the matching GitHub Release.
 
-The workflow checks out the sibling `kws/deckr` repository because this crate
-uses the local Deckr Rust core path dependency. If the current branch or tag
-exists in `kws/deckr`, the workflow uses it; otherwise it uses Deckr's default
-branch. Set the repository variable `DECKR_REF` to force a specific Deckr branch,
+The workflow checks out the sibling `kws/deckr-core-rust` repository because this
+crate uses the local Deckr Rust core path dependency. If the current branch or tag
+exists in `kws/deckr-core-rust`, the workflow uses it; otherwise it uses the core
+repository's default branch. Set the repository variable `DECKR_REF` to force a specific Deckr branch,
 tag, or 40-character commit SHA. For private repository access, add a
-`DECKR_REPO_TOKEN` secret with read access to `kws/deckr`.
+`DECKR_REPO_TOKEN` secret with read access to `kws/deckr-core-rust`.
 
 ## Release Flow
 
 Driver releases are made from a release commit that pins the workflow to the
 exact Deckr commit used for the build. This keeps the release reproducible even
-when the driver tag does not exist in the upstream `kws/deckr` repository.
+when the driver tag does not exist in the upstream `kws/deckr-core-rust` repository.
 
 1. Choose the Deckr commit SHA to release against.
 2. Update `version` in `Cargo.toml` and `Cargo.lock`.

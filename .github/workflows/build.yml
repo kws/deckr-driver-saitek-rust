@@ -21,7 +21,7 @@ concurrency:
 env:
   BIN_NAME: deckr-saitek-manager
   DRIVER_DIR: deckr-driver-saitek-rust
-  DECKR_REPOSITORY: kws/deckr
+  DECKR_REPOSITORY: kws/deckr-core-rust
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -39,12 +39,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ${{ env.DECKR_REPOSITORY }}
-          path: deckr
+          path: deckr-core-rust
           token: ${{ secrets.DECKR_REPO_TOKEN || github.token }}
 
       - name: Align Deckr dependency ref when available
         shell: bash
-        working-directory: deckr
+        working-directory: deckr-core-rust
         env:
           DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
         run: |
@@ -61,7 +61,7 @@ jobs:
           else
             echo "Deckr ref '${DECKR_REF}' not found; using checked-out default branch."
           fi
-          test -f rust/deckr/Cargo.toml
+          test -f Cargo.toml
           echo "Using Deckr $(git rev-parse HEAD)"
 
       - name: Install system packages
@@ -116,12 +116,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ${{ env.DECKR_REPOSITORY }}
-          path: deckr
+          path: deckr-core-rust
           token: ${{ secrets.DECKR_REPO_TOKEN || github.token }}
 
       - name: Align Deckr dependency ref when available
         shell: bash
-        working-directory: deckr
+        working-directory: deckr-core-rust
         env:
           DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
         run: |
@@ -138,7 +138,7 @@ jobs:
           else
             echo "Deckr ref '${DECKR_REF}' not found; using checked-out default branch."
           fi
-          test -f rust/deckr/Cargo.toml
+          test -f Cargo.toml
           echo "Using Deckr $(git rev-parse HEAD)"
 
       - name: Install system packages
@@ -213,12 +213,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ${{ env.DECKR_REPOSITORY }}
-          path: deckr
+          path: deckr-core-rust
           token: ${{ secrets.DECKR_REPO_TOKEN || github.token }}
 
       - name: Align Deckr dependency ref when available
         shell: bash
-        working-directory: deckr
+        working-directory: deckr-core-rust
         env:
           DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
         run: |
@@ -235,7 +235,7 @@ jobs:
           else
             echo "Deckr ref '${DECKR_REF}' not found; using checked-out default branch."
           fi
-          test -f rust/deckr/Cargo.toml
+          test -f Cargo.toml
           echo "Using Deckr $(git rev-parse HEAD)"
 
       - name: Set up Rust
@@ -285,12 +285,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ${{ env.DECKR_REPOSITORY }}
-          path: deckr
+          path: deckr-core-rust
           token: ${{ secrets.DECKR_REPO_TOKEN || github.token }}
 
       - name: Align Deckr dependency ref when available
         shell: bash
-        working-directory: deckr
+        working-directory: deckr-core-rust
         env:
           DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
         run: |
@@ -307,7 +307,7 @@ jobs:
           else
             echo "Deckr ref '${DECKR_REF}' not found; using checked-out default branch."
           fi
-          test -f rust/deckr/Cargo.toml
+          test -f Cargo.toml
           echo "Using Deckr $(git rev-parse HEAD)"
 
       - name: Install system packages

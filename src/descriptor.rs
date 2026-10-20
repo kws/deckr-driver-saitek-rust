@@ -44,6 +44,7 @@ pub fn device_descriptor(
         serial_number: candidate.serial_number.clone(),
         controls: control_descriptors(candidate.hid_interrupt_in.is_some()),
         capabilities: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -58,9 +59,11 @@ pub fn control_descriptors(input_enabled: bool) -> Vec<ControlDescriptor> {
             width: Some(4.0),
             height: Some(3.0),
             unit: "grid".to_string(),
+            ..Default::default()
         }),
         input_capabilities: Vec::new(),
         output_capabilities: vec![raster_output_capability(WIDTH as u32, HEIGHT as u32)],
+        ..Default::default()
     }];
 
     if input_enabled {
@@ -77,9 +80,11 @@ pub fn control_descriptors(input_enabled: bool) -> Vec<ControlDescriptor> {
                         width: Some(1.0),
                         height: Some(1.0),
                         unit: "grid".to_string(),
+                        ..Default::default()
                     }),
                     input_capabilities: vec![button_momentary_capability()],
                     output_capabilities: Vec::new(),
+                    ..Default::default()
                 }),
         );
 
@@ -94,9 +99,11 @@ pub fn control_descriptors(input_enabled: bool) -> Vec<ControlDescriptor> {
                     width: Some(1.0),
                     height: Some(1.0),
                     unit: "grid".to_string(),
+                    ..Default::default()
                 }),
                 input_capabilities: vec![encoder_relative_capability()],
                 output_capabilities: Vec::new(),
+                ..Default::default()
             },
             ControlDescriptor {
                 control_id: "right_encoder".to_string(),
@@ -108,9 +115,11 @@ pub fn control_descriptors(input_enabled: bool) -> Vec<ControlDescriptor> {
                     width: Some(1.0),
                     height: Some(1.0),
                     unit: "grid".to_string(),
+                    ..Default::default()
                 }),
                 input_capabilities: vec![encoder_relative_capability()],
                 output_capabilities: Vec::new(),
+                ..Default::default()
             },
         ]);
     }
@@ -196,6 +205,7 @@ fn button_momentary_capability() -> CapabilityDescriptor {
         constraints: Vec::new(),
         event_types: vec!["down".to_string(), "up".to_string()],
         command_types: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -222,6 +232,7 @@ fn encoder_relative_capability() -> CapabilityDescriptor {
         constraints: Vec::new(),
         event_types: vec!["rotate".to_string()],
         command_types: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -280,6 +291,7 @@ fn raster_output_capability(width: u32, height: u32) -> CapabilityDescriptor {
         ],
         event_types: Vec::new(),
         command_types: vec!["set_frame".to_string(), "clear".to_string()],
+        ..Default::default()
     }
 }
 

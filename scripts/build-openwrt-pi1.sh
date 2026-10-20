@@ -66,7 +66,8 @@ run_in_docker() {
   driver_dir="$(basename "${REPO_ROOT}")"
 
   log "Building OpenWrt Pi 1 builder image"
-  docker build -f "${REPO_ROOT}/docker/openwrt-pi1/Dockerfile" -t "${image}" "${REPO_ROOT}"
+  docker build --platform linux/amd64 \
+    -f "${REPO_ROOT}/docker/openwrt-pi1/Dockerfile" -t "${image}" "${REPO_ROOT}"
 
   log "Running OpenWrt build in Linux container"
   docker run --rm --platform linux/amd64 \
@@ -85,6 +86,8 @@ run_in_docker() {
     bash "$@"
 }
 
+[[ -f "${REPO_ROOT}/../deckr-core-rust/Cargo.toml" ]] || die "missing sibling Deckr Rust core checkout at ../deckr-core-rust"
+
 if [[ "${OPENWRT_USE_DOCKER:-auto}" != "0" && "${inside_container}" -eq 0 && "$(uname -s)" != "Linux" ]]; then
   run_in_docker "$@"
   exit 0
@@ -92,7 +95,6 @@ fi
 
 [[ "$(uname -s)" == "Linux" ]] || die "OpenWrt SDK ${SDK_ARCHIVE} runs on Linux x86_64; rerun with Docker enabled"
 [[ "$(uname -m)" == "x86_64" ]] || die "OpenWrt SDK ${SDK_ARCHIVE} requires x86_64 Linux"
-[[ -f "${REPO_ROOT}/../deckr/rust/deckr/Cargo.toml" ]] || die "missing sibling Deckr checkout at ../deckr/rust/deckr"
 
 jobs() {
   if have nproc; then

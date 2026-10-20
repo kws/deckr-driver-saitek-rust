@@ -10,10 +10,10 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use deckr::hardware::runtime::{
-    HardwareCommandFuture, HardwareCommandHandler, HardwareCommandOutcome,
+    HardwareCommandContext, HardwareCommandFuture, HardwareCommandHandler, HardwareCommandOutcome,
     HardwareManagerRuntime as ManagedHardwareRuntime, HardwareResetFuture, HardwareResetHandler,
 };
-use deckr::lanes::{DeckrMessage, HardwareMessageBody};
+use deckr::lanes::HardwareMessageBody;
 use deckr::nats::{DeckrRuntime, NatsDeckrRuntime, NatsStateStore};
 use deckr::state::StateMaintenancePolicy;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
@@ -40,7 +40,7 @@ type ManagedNatsHardwareRuntime =
     ManagedHardwareRuntime<NatsStateStore, NatsStateStore, NatsStateStore, NatsDeckrRuntime>;
 
 #[derive(Debug, Clone)]
-pub enum RuntimeCommand {
+enum HardwareOutput {
     SetRasterFrame {
         control_id: String,
         encoding: String,
@@ -49,6 +49,26 @@ pub enum RuntimeCommand {
     ClearRaster {
         control_id: String,
     },
+}
+
+#[derive(Clone)]
+struct AuthorizedOutput {
+    output: HardwareOutput,
+    context: Box<HardwareCommandContext>,
+}
+
+impl std::fmt::Debug for AuthorizedOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedOutput")
+            .field("output", &self.output)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RuntimeCommand {
+    Hardware(AuthorizedOutput),
     ResetDevice,
     Stop,
 }
@@ -62,11 +82,22 @@ impl RuntimeCommand {
         matches!(self, Self::ResetDevice)
     }
 
+    fn is_raster_frame(&self) -> bool {
+        matches!(
+            self,
+            Self::Hardware(AuthorizedOutput {
+                output: HardwareOutput::SetRasterFrame { .. },
+                ..
+            })
+        )
+    }
+
     fn raster_control_id(&self) -> Option<&str> {
         match self {
-            Self::SetRasterFrame { control_id, .. } | Self::ClearRaster { control_id } => {
-                Some(control_id)
-            }
+            Self::Hardware(AuthorizedOutput { output, .. }) => match output {
+                HardwareOutput::SetRasterFrame { control_id, .. }
+                | HardwareOutput::ClearRaster { control_id } => Some(control_id),
+            },
             _ => None,
         }
     }
@@ -248,10 +279,7 @@ fn enqueue_bounded_command(queue: &mut VecDeque<RuntimeCommand>, command: Runtim
         queue.retain(|queued| queued.raster_control_id() != Some(control_id.as_str()));
     }
     while queue.len() >= COMMAND_QUEUE_CAPACITY {
-        if let Some(index) = queue
-            .iter()
-            .position(|queued| matches!(queued, RuntimeCommand::SetRasterFrame { .. }))
-        {
+        if let Some(index) = queue.iter().position(RuntimeCommand::is_raster_frame) {
             queue.remove(index);
         } else if let Some(index) = queue
             .iter()
@@ -287,11 +315,15 @@ impl SaitekHardwareHandler {
 }
 
 impl HardwareCommandHandler for SaitekHardwareHandler {
-    fn handle_hardware_command<'a>(&'a self, message: DeckrMessage) -> HardwareCommandFuture<'a> {
+    fn handle_authorized_hardware_command<'a>(
+        &'a self,
+        context: HardwareCommandContext,
+    ) -> HardwareCommandFuture<'a> {
         Box::pin(async move {
-            let body = message.hardware_body()?;
+            context.authorize()?;
+            let body = context.message().hardware_body()?;
             let device_id = body.device_ref().device_id.clone();
-            let command = match runtime_command_from_body(body) {
+            let command = match hardware_output_from_body(body) {
                 Ok(command) => command,
                 Err(error) => {
                     tracing::debug!(%error, "unsupported hardware command");
@@ -302,7 +334,14 @@ impl HardwareCommandHandler for SaitekHardwareHandler {
                 tracing::debug!(%device_id, "hardware command targets a disconnected device");
                 return Ok(HardwareCommandOutcome::Stale);
             };
-            if sender.send(command).is_err() {
+            context.authorize()?;
+            if sender
+                .send(RuntimeCommand::Hardware(AuthorizedOutput {
+                    output: command,
+                    context: Box::new(context),
+                }))
+                .is_err()
+            {
                 tracing::debug!(%device_id, "hardware command queue is disconnected");
                 return Ok(HardwareCommandOutcome::Stale);
             }
@@ -328,11 +367,11 @@ enum WorkerEvent {
         path_key: String,
         device_id: String,
         command_tx: CommandSender,
-        device: deckr::lanes::DeviceDescriptor,
+        device: Box<deckr::lanes::DeviceDescriptor>,
     },
     Input {
         device_id: String,
-        body: HardwareMessageBody,
+        body: Box<HardwareMessageBody>,
     },
     Disconnected {
         path_key: String,
@@ -351,13 +390,13 @@ enum WorkerReport {
         path_key: String,
         device_id: String,
         command_tx: CommandSender,
-        device: deckr::lanes::DeviceDescriptor,
+        device: Box<deckr::lanes::DeviceDescriptor>,
     },
     Input {
         worker_id: u64,
         path_key: String,
         device_id: String,
-        body: HardwareMessageBody,
+        body: Box<HardwareMessageBody>,
     },
     Disconnected {
         worker_id: u64,
@@ -549,11 +588,11 @@ async fn worker_event_loop(
                 hardware_handler
                     .register_device(device_id.clone(), command_tx)
                     .await;
-                hardware_runtime.set_device(device).await?;
+                hardware_runtime.set_device(*device).await?;
             }
             WorkerEvent::Input { device_id, body } => {
                 debug!("Routing Saitek hardware input for {device_id}");
-                hardware_runtime.handle_hardware_message(body).await?;
+                hardware_runtime.handle_hardware_message(*body).await?;
             }
             WorkerEvent::Disconnected {
                 path_key,
@@ -573,7 +612,7 @@ async fn worker_event_loop(
     bail!("device worker event stream closed")
 }
 
-fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand> {
+fn hardware_output_from_body(body: HardwareMessageBody) -> Result<HardwareOutput> {
     match body {
         HardwareMessageBody::ControlCommand {
             control_id,
@@ -594,7 +633,7 @@ fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand
             if !matches!(encoding, "jpeg" | "png") {
                 bail!("controlCommand set_frame encoding must be jpeg or png");
             }
-            Ok(RuntimeCommand::SetRasterFrame {
+            Ok(HardwareOutput::SetRasterFrame {
                 control_id,
                 encoding: encoding.to_string(),
                 image: STANDARD
@@ -611,7 +650,7 @@ fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand
         } if capability_id == RASTER_CAPABILITY_ID && command_type == "clear" => {
             let control_id = control_id.context("raster clear requires controlId")?;
             ensure_empty_params(&params, "raster clear")?;
-            Ok(RuntimeCommand::ClearRaster { control_id })
+            Ok(HardwareOutput::ClearRaster { control_id })
         }
         HardwareMessageBody::ControlCommand {
             capability_id,
@@ -948,7 +987,11 @@ fn device_worker(
             path_key: path_key.clone(),
             device_id: local_device_id.clone(),
             command_tx: command_tx.clone(),
-            device: device_descriptor(&runtime_descriptor, &local_device_id, &fingerprint),
+            device: Box::new(device_descriptor(
+                &runtime_descriptor,
+                &local_device_id,
+                &fingerprint,
+            )),
         })
         .ok();
 
@@ -1010,7 +1053,7 @@ fn device_worker(
                     worker_id,
                     path_key: path_key.clone(),
                     device_id: local_device_id.clone(),
-                    body,
+                    body: Box::new(body),
                 });
             }
         }
@@ -1020,7 +1063,29 @@ fn device_worker(
 
 fn apply_runtime_command(handle: &mut dyn DeviceHandle, command: RuntimeCommand) -> Result<()> {
     match command {
-        RuntimeCommand::SetRasterFrame {
+        RuntimeCommand::Hardware(AuthorizedOutput { output, context }) => {
+            apply_hardware_output(handle, output, || context.authorize())?;
+        }
+        RuntimeCommand::ResetDevice => {
+            handle.clear_image(DEFAULT_PAGE_ID)?;
+        }
+        RuntimeCommand::Stop => {}
+    }
+    Ok(())
+}
+
+fn apply_hardware_output(
+    handle: &mut dyn DeviceHandle,
+    output: HardwareOutput,
+    mut authorize: impl FnMut() -> deckr::Result<()>,
+) -> Result<()> {
+    // Authority loss discards this command; it is not a USB failure.
+    if let Err(error) = authorize() {
+        debug!(%error, "discarding hardware command without current authority");
+        return Ok(());
+    }
+    match output {
+        HardwareOutput::SetRasterFrame {
             control_id,
             encoding,
             image,
@@ -1033,19 +1098,19 @@ fn apply_runtime_command(handle: &mut dyn DeviceHandle, command: RuntimeCommand)
                 bail!("unsupported raster encoding {encoding}");
             }
             let frame = encoded_image_to_fip_frame(&image)?;
+            if let Err(error) = authorize() {
+                debug!(%error, "discarding raster frame after authority loss during conversion");
+                return Ok(());
+            }
             handle.send_image(&frame, DEFAULT_PAGE_ID)?;
         }
-        RuntimeCommand::ClearRaster { control_id } => {
+        HardwareOutput::ClearRaster { control_id } => {
             if control_id != SCREEN_CONTROL_ID {
                 warn!("Ignoring raster clear for unknown control {control_id}");
                 return Ok(());
             }
             handle.clear_image(DEFAULT_PAGE_ID)?;
         }
-        RuntimeCommand::ResetDevice => {
-            handle.clear_image(DEFAULT_PAGE_ID)?;
-        }
-        RuntimeCommand::Stop => {}
     }
     Ok(())
 }
@@ -1063,7 +1128,7 @@ mod tests {
     use deckr::hardware::runtime::{
         HardwareLaneTransport, HardwareManagerRuntimeSpec, HardwareMessageStream,
     };
-    use deckr::lanes::{DeviceDescriptor, DeviceRef};
+    use deckr::lanes::{DeckrMessage, DeviceDescriptor, DeviceRef};
     use deckr::profiles::hardware::{
         HardwareClaimDevice, HardwareClaimTerms, HARDWARE_CLAIM_PROFILE_ID,
     };
@@ -1197,6 +1262,10 @@ mod tests {
         };
         let contract = concord
             .create_contract(CreateContractSpec {
+                participant_sessions: BTreeMap::from([
+                    (controller.to_string(), "controller-session".to_string()),
+                    (manager.to_string(), "manager-session".to_string()),
+                ]),
                 participants: vec![controller.clone(), manager],
                 contract_id: Some(contract_id.to_string()),
                 generation: 1,
@@ -1548,10 +1617,10 @@ mod tests {
                 h.handler
                     .register_device(device_id.clone(), command_tx)
                     .await;
-                h.runtime.set_device(device).await.unwrap();
+                h.runtime.set_device(*device).await.unwrap();
             }
             WorkerEvent::Input { body, .. } => {
-                h.runtime.handle_hardware_message(body).await.unwrap();
+                h.runtime.handle_hardware_message(*body).await.unwrap();
             }
             WorkerEvent::Disconnected { device_id, .. } => {
                 h.handler.remove_device(&device_id).await;
@@ -1591,65 +1660,126 @@ mod tests {
         }
     }
 
-    #[test]
-    fn command_queue_keeps_latest_raster_frame_per_control() {
+    async fn queued_output(
+        h: &ManagedHarness,
+        command_rx: &CommandReceiver,
+        contract_id: &str,
+        command_type: &str,
+    ) -> RuntimeCommand {
+        h.lane.publish_inbound(
+            DeckrMessage::hardware_command(
+                "main",
+                "controller-session",
+                "saitek-main",
+                "manager-session",
+                "fip",
+                contract_pointer(contract_id),
+                raster_command(command_type),
+            )
+            .unwrap(),
+        );
+        wait_for_runtime_command(command_rx, "hardware output", |command| {
+            matches!(command, RuntimeCommand::Hardware(_))
+        })
+    }
+
+    async fn output_harness() -> (
+        ManagedHarness,
+        JoinSet<deckr::Result<()>>,
+        CommandSender,
+        CommandReceiver,
+        ContractHandle,
+    ) {
+        let h = managed_harness().await;
+        let tasks = start_managed_runtime(&h).await;
         let (command_tx, command_rx) = command_channel();
+        h.handler
+            .register_device("fip".into(), command_tx.clone())
+            .await;
+        h.runtime
+            .set_device(test_device_descriptor("fip", "fingerprint:fip"))
+            .await
+            .unwrap();
+        let claim = create_claim(&h.concord, "claim-a", "fip", Some("fingerprint:fip")).await;
+        (h, tasks, command_tx, command_rx, claim)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn command_queue_keeps_latest_raster_frame_per_control() {
+        let (h, tasks, command_tx, command_rx, _) = output_harness().await;
+        let RuntimeCommand::Hardware(template) =
+            queued_output(&h, &command_rx, "claim-a", "set_frame").await
+        else {
+            unreachable!()
+        };
 
         for value in 0..COMMAND_QUEUE_CAPACITY * 4 {
             command_tx
-                .send(RuntimeCommand::SetRasterFrame {
-                    control_id: SCREEN_CONTROL_ID.to_string(),
-                    encoding: "png".to_string(),
-                    image: vec![value as u8],
-                })
+                .send(RuntimeCommand::Hardware(AuthorizedOutput {
+                    output: HardwareOutput::SetRasterFrame {
+                        control_id: SCREEN_CONTROL_ID.to_string(),
+                        encoding: "png".to_string(),
+                        image: vec![value as u8],
+                    },
+                    context: template.context.clone(),
+                }))
                 .unwrap();
         }
 
         match command_rx.try_recv().unwrap() {
-            RuntimeCommand::SetRasterFrame {
-                control_id, image, ..
-            } => {
+            RuntimeCommand::Hardware(AuthorizedOutput {
+                output:
+                    HardwareOutput::SetRasterFrame {
+                        control_id, image, ..
+                    },
+                ..
+            }) => {
                 assert_eq!(control_id, SCREEN_CONTROL_ID);
                 assert_eq!(image, vec![(COMMAND_QUEUE_CAPACITY * 4 - 1) as u8]);
             }
             other => panic!("expected latest raster frame, got {other:?}"),
         }
         assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
+        stop_managed_runtime(&h, tasks).await;
     }
 
-    #[test]
-    fn command_queue_preserves_stop_priority() {
-        let (command_tx, command_rx) = command_channel();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn command_queue_preserves_stop_priority() {
+        let (h, tasks, command_tx, command_rx, _) = output_harness().await;
+        let RuntimeCommand::Hardware(template) =
+            queued_output(&h, &command_rx, "claim-a", "set_frame").await
+        else {
+            unreachable!()
+        };
 
         for index in 0..COMMAND_QUEUE_CAPACITY * 4 {
             command_tx
-                .send(RuntimeCommand::SetRasterFrame {
-                    control_id: format!("control-{index}"),
-                    encoding: "png".to_string(),
-                    image: vec![index as u8],
-                })
+                .send(RuntimeCommand::Hardware(AuthorizedOutput {
+                    output: HardwareOutput::SetRasterFrame {
+                        control_id: format!("control-{index}"),
+                        encoding: "png".to_string(),
+                        image: vec![index as u8],
+                    },
+                    context: template.context.clone(),
+                }))
                 .unwrap();
         }
         command_tx.send(RuntimeCommand::Stop).unwrap();
+        command_tx.send(RuntimeCommand::Hardware(template)).unwrap();
 
         assert!(matches!(
             command_rx.try_recv().unwrap(),
             RuntimeCommand::Stop
         ));
         assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
+        stop_managed_runtime(&h, tasks).await;
     }
 
-    #[test]
-    fn command_queue_preserves_reset_priority() {
-        let (command_tx, command_rx) = command_channel();
-
-        command_tx
-            .send(RuntimeCommand::SetRasterFrame {
-                control_id: SCREEN_CONTROL_ID.to_string(),
-                encoding: "png".to_string(),
-                image: b"stale".to_vec(),
-            })
-            .unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn command_queue_preserves_reset_priority() {
+        let (h, tasks, command_tx, command_rx, _) = output_harness().await;
+        let command = queued_output(&h, &command_rx, "claim-a", "set_frame").await;
+        command_tx.send(command).unwrap();
         command_tx.send(RuntimeCommand::ResetDevice).unwrap();
 
         assert!(matches!(
@@ -1657,6 +1787,7 @@ mod tests {
             RuntimeCommand::ResetDevice
         ));
         assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
+        stop_managed_runtime(&h, tasks).await;
     }
 
     #[test]
@@ -1886,9 +2017,7 @@ mod tests {
             .unwrap(),
         );
 
-        wait_for_runtime_command(&command_rx, "raster frame", |command| {
-            matches!(command, RuntimeCommand::SetRasterFrame { .. })
-        });
+        wait_for_runtime_command(&command_rx, "raster frame", RuntimeCommand::is_raster_frame);
         let token = h
             .concord
             .participant_token(&contract, &manager_endpoint())
@@ -1907,9 +2036,7 @@ mod tests {
             )
             .unwrap(),
         );
-        wait_for_runtime_command(&command_rx, "raster frame", |command| {
-            matches!(command, RuntimeCommand::SetRasterFrame { .. })
-        });
+        wait_for_runtime_command(&command_rx, "raster frame", RuntimeCommand::is_raster_frame);
         let refreshed = h
             .concord
             .participant_token(&contract, &manager_endpoint())
@@ -1956,9 +2083,11 @@ mod tests {
             "Hardware command unauthorized",
         )
         .await;
-        assert_no_queued_runtime_command(&command_rx, "raster frame", |command| {
-            matches!(command, RuntimeCommand::SetRasterFrame { .. })
-        });
+        assert_no_queued_runtime_command(
+            &command_rx,
+            "raster frame",
+            RuntimeCommand::is_raster_frame,
+        );
 
         let published_before = h.lane.published().await.len();
         h.lane.publish_inbound(
@@ -1980,9 +2109,11 @@ mod tests {
             "Hardware command unsupported",
         )
         .await;
-        assert_no_queued_runtime_command(&command_rx, "raster frame", |command| {
-            matches!(command, RuntimeCommand::SetRasterFrame { .. })
-        });
+        assert_no_queued_runtime_command(
+            &command_rx,
+            "raster frame",
+            RuntimeCommand::is_raster_frame,
+        );
 
         stop_managed_runtime(&h, tasks).await;
     }
@@ -2012,9 +2143,7 @@ mod tests {
             )
             .unwrap(),
         );
-        wait_for_runtime_command(&command_rx, "raster frame", |command| {
-            matches!(command, RuntimeCommand::SetRasterFrame { .. })
-        });
+        wait_for_runtime_command(&command_rx, "raster frame", RuntimeCommand::is_raster_frame);
 
         h.concord
             .cancel(
@@ -2042,9 +2171,7 @@ mod tests {
             )
             .unwrap(),
         );
-        wait_for_runtime_command(&command_rx, "raster frame", |command| {
-            matches!(command, RuntimeCommand::SetRasterFrame { .. })
-        });
+        wait_for_runtime_command(&command_rx, "raster frame", RuntimeCommand::is_raster_frame);
         h.handler.remove_device("fip").await;
         h.runtime
             .remove_device("fip", "disconnected")
@@ -2060,25 +2187,166 @@ mod tests {
         stop_managed_runtime(&h, tasks).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_queued_outputs_stay_revoked_after_successor_claim() {
+        let (h, tasks, command_tx, command_rx, first) = output_harness().await;
+        // Hold dequeued work so a reset cannot remove it from the queue.
+        let old_frame = queued_output(&h, &command_rx, "claim-a", "set_frame").await;
+        let old_clear = queued_output(&h, &command_rx, "claim-a", "clear").await;
+        h.concord
+            .cancel(
+                &first,
+                &EndpointAddress::parse("controller:main").unwrap(),
+                Some("transferred".into()),
+            )
+            .await
+            .unwrap();
+        wait_for_runtime_command(&command_rx, "reset device", RuntimeCommand::is_reset);
+        create_claim(&h.concord, "claim-b", "fip", Some("fingerprint:fip")).await;
+
+        let backend = FakeBackend::new();
+        let mut handle = FakeHandle {
+            state: backend.device.clone(),
+        };
+        apply_runtime_command(&mut handle, old_frame.clone()).unwrap();
+        apply_runtime_command(&mut handle, old_clear).unwrap();
+        assert!(backend.commands().is_empty());
+
+        let new_frame = queued_output(&h, &command_rx, "claim-b", "set_frame").await;
+        command_tx.send(old_frame).unwrap();
+        command_tx.send(new_frame).unwrap();
+        // Coalescing must retain the new command's authority along with its image.
+        apply_runtime_command(&mut handle, command_rx.try_recv().unwrap()).unwrap();
+        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
+        let new_clear = queued_output(&h, &command_rx, "claim-b", "clear").await;
+        apply_runtime_command(&mut handle, new_clear).unwrap();
+        assert_eq!(backend.commands(), [REQ_SET_IMAGE, REQ_CLEAR_IMAGE]);
+        stop_managed_runtime(&h, tasks).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_outputs_are_discarded_after_device_or_runtime_authority_loss() {
+        for cause in ["replacement", "disconnect", "shutdown", "token loss"] {
+            let (h, tasks, _command_tx, command_rx, claim) = output_harness().await;
+            let frame = queued_output(&h, &command_rx, "claim-a", "set_frame").await;
+            let clear = queued_output(&h, &command_rx, "claim-a", "clear").await;
+            match cause {
+                "replacement" => {
+                    h.runtime
+                        .set_device(test_device_descriptor("fip", "replacement"))
+                        .await
+                        .unwrap();
+                }
+                "disconnect" => {
+                    h.handler.remove_device("fip").await;
+                    h.runtime
+                        .remove_device("fip", "disconnected")
+                        .await
+                        .unwrap();
+                }
+                "shutdown" => h.runtime.stop().await.unwrap(),
+                "token loss" => {
+                    let token = h
+                        .concord
+                        .participant_token(&claim, &manager_endpoint())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    h.concord.withdraw(&token).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let RuntimeCommand::Hardware(authorized) = &frame else {
+                unreachable!()
+            };
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while authorized.context.authorize().is_ok() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("queued context should lose authority");
+
+            let backend = FakeBackend::new();
+            let mut handle = FakeHandle {
+                state: backend.device.clone(),
+            };
+            apply_runtime_command(&mut handle, frame).unwrap();
+            apply_runtime_command(&mut handle, clear).unwrap();
+            assert!(
+                backend.commands().is_empty(),
+                "{cause} must fence USB output"
+            );
+            apply_runtime_command(&mut handle, RuntimeCommand::ResetDevice).unwrap();
+            assert_eq!(backend.commands(), [REQ_CLEAR_IMAGE]);
+            stop_managed_runtime(&h, tasks).await;
+        }
+    }
+
     #[test]
-    fn runtime_command_from_hardware_body_maps_outputs() {
+    fn raster_authority_is_rechecked_after_image_conversion() {
+        let backend = FakeBackend::new();
+        let mut handle = FakeHandle {
+            state: backend.device.clone(),
+        };
+        let mut checks = 0;
+        apply_hardware_output(
+            &mut handle,
+            hardware_output_from_body(raster_command("set_frame")).unwrap(),
+            || {
+                checks += 1;
+                if checks == 1 {
+                    Ok(())
+                } else {
+                    Err(deckr::Error::Unauthorized(
+                        "claim ended during conversion".into(),
+                    ))
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(checks, 2);
+        assert!(backend.commands().is_empty());
+    }
+
+    #[test]
+    fn unauthorized_frame_is_discarded_before_decoding() {
+        let backend = FakeBackend::new();
+        let mut handle = FakeHandle {
+            state: backend.device.clone(),
+        };
+        apply_hardware_output(
+            &mut handle,
+            HardwareOutput::SetRasterFrame {
+                control_id: SCREEN_CONTROL_ID.into(),
+                encoding: "png".into(),
+                image: b"invalid image".to_vec(),
+            },
+            || Err(deckr::Error::Unauthorized("claim ended in queue".into())),
+        )
+        .unwrap();
+        assert!(backend.commands().is_empty());
+    }
+
+    #[test]
+    fn hardware_output_from_body_maps_outputs() {
         assert!(matches!(
-            runtime_command_from_body(raster_command("set_frame")).unwrap(),
-            RuntimeCommand::SetRasterFrame { .. }
+            hardware_output_from_body(raster_command("set_frame")).unwrap(),
+            HardwareOutput::SetRasterFrame { .. }
         ));
         assert!(matches!(
-            runtime_command_from_body(raster_command("clear")).unwrap(),
-            RuntimeCommand::ClearRaster { .. }
+            hardware_output_from_body(raster_command("clear")).unwrap(),
+            HardwareOutput::ClearRaster { .. }
         ));
     }
 
     #[test]
-    fn runtime_command_from_hardware_body_rejects_under_shaped_params() {
+    fn hardware_output_from_body_rejects_under_shaped_params() {
         let mut missing_encoding = raster_command("set_frame");
         if let HardwareMessageBody::ControlCommand { params, .. } = &mut missing_encoding {
             params.remove("encoding");
         }
-        assert!(runtime_command_from_body(missing_encoding).is_err());
+        assert!(hardware_output_from_body(missing_encoding).is_err());
 
         let mut invalid_encoding = raster_command("set_frame");
         if let HardwareMessageBody::ControlCommand { params, .. } = &mut invalid_encoding {
@@ -2087,13 +2355,13 @@ mod tests {
                 serde_json::Value::String("gif".to_string()),
             );
         }
-        assert!(runtime_command_from_body(invalid_encoding).is_err());
+        assert!(hardware_output_from_body(invalid_encoding).is_err());
 
         let mut non_empty_clear = raster_command("clear");
         if let HardwareMessageBody::ControlCommand { params, .. } = &mut non_empty_clear {
             params.insert("unexpected".to_string(), serde_json::Value::Bool(true));
         }
-        assert!(runtime_command_from_body(non_empty_clear).is_err());
+        assert!(hardware_output_from_body(non_empty_clear).is_err());
     }
 
     #[test]
@@ -2115,13 +2383,14 @@ mod tests {
             state: backend.device.clone(),
         };
 
-        apply_runtime_command(
+        apply_hardware_output(
             &mut handle,
-            RuntimeCommand::SetRasterFrame {
+            HardwareOutput::SetRasterFrame {
                 control_id: SCREEN_CONTROL_ID.to_string(),
                 encoding: "png".to_string(),
                 image: make_png(),
             },
+            || Ok(()),
         )
         .unwrap();
 
