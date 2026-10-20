@@ -242,7 +242,7 @@ build_binary() {
   rustflags="-C target-cpu=arm1176jzf-s -C link-arg=--sysroot=${target_staging} -C link-arg=-Wl,-rpath-link,${target_staging}/usr/lib"
   export RUSTFLAGS="${RUSTFLAGS:-} ${rustflags}"
 
-  cargo build --release --target "${RUST_TARGET}"
+  cargo build --locked --release --target "${RUST_TARGET}"
 }
 
 verify_binary() {

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use rusb::{
@@ -242,19 +242,25 @@ impl UsbFipHandle {
         packet: FipControlPacket,
         payload: Option<&[u8]>,
     ) -> Result<FipControlPacket> {
-        self.write_all(&packet.to_bytes())?;
+        // One deadline covers the whole operation, not five seconds per USB chunk.
+        let deadline = Instant::now() + self.timeout;
+        self.write_all(&packet.to_bytes(), deadline)?;
         if let Some(payload) = payload {
-            self.write_all(payload)?;
+            self.write_all(payload, deadline)?;
         }
-        self.read_reply()
+        self.read_reply(deadline)
     }
 
-    fn write_all(&mut self, data: &[u8]) -> Result<()> {
+    fn write_all(&mut self, data: &[u8], deadline: Instant) -> Result<()> {
         let chunk_size = self.candidate.vendor_out_packet_size.max(1);
         for chunk in data.chunks(chunk_size) {
             let written = self
                 .handle
-                .write_bulk(self.candidate.vendor_bulk_out, chunk, self.timeout)
+                .write_bulk(
+                    self.candidate.vendor_bulk_out,
+                    chunk,
+                    remaining_timeout(deadline)?,
+                )
                 .context("USB bulk OUT transfer failed")?;
             if written != chunk.len() {
                 bail!("Short USB write: wrote {written} of {} bytes", chunk.len());
@@ -263,17 +269,29 @@ impl UsbFipHandle {
         Ok(())
     }
 
-    fn read_reply(&mut self) -> Result<FipControlPacket> {
+    fn read_reply(&mut self, deadline: Instant) -> Result<FipControlPacket> {
         let mut buffer = [0u8; CONTROL_PACKET_SIZE];
         let size = self
             .handle
-            .read_bulk(self.candidate.vendor_bulk_in, &mut buffer, self.timeout)
+            .read_bulk(
+                self.candidate.vendor_bulk_in,
+                &mut buffer,
+                remaining_timeout(deadline)?,
+            )
             .context("USB bulk IN reply read failed")?;
         if size != CONTROL_PACKET_SIZE {
             bail!("Short USB reply: expected {CONTROL_PACKET_SIZE} bytes, got {size}");
         }
         FipControlPacket::from_bytes(&buffer)
     }
+}
+
+fn remaining_timeout(deadline: Instant) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        // rusb truncates to milliseconds; zero means an infinite libusb timeout.
+        .filter(|remaining| remaining.as_millis() > 0)
+        .context("USB operation deadline exceeded")
 }
 
 impl Drop for UsbFipHandle {
@@ -392,27 +410,61 @@ fn find_device(candidate: &DeviceCandidate) -> Result<Device<GlobalContext>> {
     )
 }
 
+trait InterfaceHandle {
+    fn kernel_driver_active(&self, interface: u8) -> rusb::Result<bool>;
+    fn detach_kernel_driver(&mut self, interface: u8) -> rusb::Result<()>;
+    fn attach_kernel_driver(&mut self, interface: u8) -> rusb::Result<()>;
+    fn claim_interface(&mut self, interface: u8) -> rusb::Result<()>;
+    fn release_interface(&mut self, interface: u8) -> rusb::Result<()>;
+}
+
+impl InterfaceHandle for UsbDeviceHandle<GlobalContext> {
+    fn kernel_driver_active(&self, interface: u8) -> rusb::Result<bool> {
+        UsbDeviceHandle::kernel_driver_active(self, interface)
+    }
+    fn detach_kernel_driver(&mut self, interface: u8) -> rusb::Result<()> {
+        UsbDeviceHandle::detach_kernel_driver(self, interface)
+    }
+    fn attach_kernel_driver(&mut self, interface: u8) -> rusb::Result<()> {
+        UsbDeviceHandle::attach_kernel_driver(self, interface)
+    }
+    fn claim_interface(&mut self, interface: u8) -> rusb::Result<()> {
+        UsbDeviceHandle::claim_interface(self, interface)
+    }
+    fn release_interface(&mut self, interface: u8) -> rusb::Result<()> {
+        UsbDeviceHandle::release_interface(self, interface)
+    }
+}
+
 fn claim_interface(
-    handle: &mut UsbDeviceHandle<GlobalContext>,
+    handle: &mut impl InterfaceHandle,
     interface: u8,
     claimed: &mut Vec<u8>,
     detached: &mut Vec<u8>,
 ) -> Result<()> {
-    if matches!(handle.kernel_driver_active(interface), Ok(true)) {
+    let detached_here = matches!(handle.kernel_driver_active(interface), Ok(true));
+    if detached_here {
         handle
             .detach_kernel_driver(interface)
             .with_context(|| format!("detaching kernel driver for interface {interface}"))?;
+    }
+    if let Err(error) = handle.claim_interface(interface) {
+        if detached_here {
+            if let Err(rollback) = handle.attach_kernel_driver(interface) {
+                tracing::warn!(%interface, %rollback, "restoring kernel driver after failed USB claim");
+            }
+        }
+        return Err(error).with_context(|| format!("claiming interface {interface}"));
+    }
+    claimed.push(interface);
+    if detached_here {
         detached.push(interface);
     }
-    handle
-        .claim_interface(interface)
-        .with_context(|| format!("claiming interface {interface}"))?;
-    claimed.push(interface);
     Ok(())
 }
 
 fn rollback_interfaces(
-    handle: &mut UsbDeviceHandle<GlobalContext>,
+    handle: &mut impl InterfaceHandle,
     claimed: &mut Vec<u8>,
     claimed_before: usize,
     detached: &mut Vec<u8>,
@@ -423,5 +475,92 @@ fn rollback_interfaces(
     }
     for interface in detached.drain(detached_before..).rev() {
         let _ = handle.attach_kernel_driver(interface);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeInterfaces {
+        calls: Vec<(&'static str, u8)>,
+        fail_claim: Option<u8>,
+        attached: bool,
+    }
+
+    impl InterfaceHandle for FakeInterfaces {
+        fn kernel_driver_active(&self, _: u8) -> rusb::Result<bool> {
+            Ok(self.attached)
+        }
+        fn detach_kernel_driver(&mut self, interface: u8) -> rusb::Result<()> {
+            self.calls.push(("detach", interface));
+            self.attached = false;
+            Ok(())
+        }
+        fn attach_kernel_driver(&mut self, interface: u8) -> rusb::Result<()> {
+            self.calls.push(("attach", interface));
+            self.attached = true;
+            Ok(())
+        }
+        fn claim_interface(&mut self, interface: u8) -> rusb::Result<()> {
+            self.calls.push(("claim", interface));
+            if self.fail_claim == Some(interface) {
+                Err(rusb::Error::Busy)
+            } else {
+                Ok(())
+            }
+        }
+        fn release_interface(&mut self, interface: u8) -> rusb::Result<()> {
+            self.calls.push(("release", interface));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_vendor_claim_restores_detached_kernel_driver() {
+        let mut handle = FakeInterfaces {
+            calls: Vec::new(),
+            fail_claim: Some(1),
+            attached: true,
+        };
+        let (mut claimed, mut detached) = (Vec::new(), Vec::new());
+        assert!(claim_interface(&mut handle, 1, &mut claimed, &mut detached).is_err());
+        assert!(handle.attached);
+        assert!(claimed.is_empty() && detached.is_empty());
+        assert_eq!(handle.calls, [("detach", 1), ("claim", 1), ("attach", 1)]);
+    }
+
+    #[test]
+    fn failed_optional_claim_preserves_previously_owned_interface() {
+        let mut handle = FakeInterfaces {
+            calls: Vec::new(),
+            fail_claim: Some(0),
+            attached: true,
+        };
+        let (mut claimed, mut detached) = (Vec::new(), Vec::new());
+        claim_interface(&mut handle, 1, &mut claimed, &mut detached).unwrap();
+        handle.attached = true; // The other interface has its own kernel driver.
+        assert!(claim_interface(&mut handle, 0, &mut claimed, &mut detached).is_err());
+        rollback_interfaces(&mut handle, &mut claimed, 1, &mut detached, 1);
+        assert_eq!(claimed, [1]);
+        assert_eq!(detached, [1]);
+        assert_eq!(
+            handle.calls,
+            [
+                ("detach", 1),
+                ("claim", 1),
+                ("detach", 0),
+                ("claim", 0),
+                ("attach", 0)
+            ]
+        );
+        rollback_interfaces(&mut handle, &mut claimed, 0, &mut detached, 0);
+        assert_eq!(&handle.calls[5..], [("release", 1), ("attach", 1)]);
+    }
+
+    #[test]
+    fn expired_usb_operation_never_uses_libusb_infinite_timeout() {
+        assert!(remaining_timeout(Instant::now() - Duration::from_millis(1)).is_err());
+        assert!(remaining_timeout(Instant::now() + Duration::from_micros(500)).is_err());
     }
 }

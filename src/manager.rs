@@ -1,10 +1,15 @@
 #![cfg_attr(test, allow(dead_code))]
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+use std::future::Future;
+#[cfg(test)]
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
@@ -14,6 +19,7 @@ use deckr::hardware::runtime::{
     HardwareManagerRuntime as ManagedHardwareRuntime, HardwareResetFuture, HardwareResetHandler,
 };
 use deckr::lanes::HardwareMessageBody;
+use deckr::lifecycle::Cancellation;
 use deckr::nats::{DeckrRuntime, NatsDeckrRuntime, NatsStateStore};
 use deckr::state::StateMaintenancePolicy;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
@@ -35,6 +41,8 @@ const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const USB_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BACKOFF_SECS: u64 = 10;
 const COMMAND_QUEUE_CAPACITY: usize = 32;
+const OUTPUT_BATCH_SIZE: usize = 4;
+const BUSY_READ_TIMEOUT: Duration = Duration::from_millis(1);
 
 type ManagedNatsHardwareRuntime =
     ManagedHardwareRuntime<NatsStateStore, NatsStateStore, NatsStateStore, NatsDeckrRuntime>;
@@ -120,6 +128,7 @@ struct CommandQueueState {
     queue: VecDeque<RuntimeCommand>,
     sender_count: usize,
     receiver_alive: bool,
+    stopping: bool,
 }
 
 struct CommandSender {
@@ -136,6 +145,7 @@ fn command_channel() -> (CommandSender, CommandReceiver) {
             queue: VecDeque::new(),
             sender_count: 1,
             receiver_alive: true,
+            stopping: false,
         }),
         available: Condvar::new(),
     });
@@ -194,13 +204,14 @@ impl CommandSender {
         }
 
         if command.is_stop() {
+            state.stopping = true;
             state.queue.clear();
             state.queue.push_front(command);
             self.inner.available.notify_all();
             return Ok(());
         }
 
-        if state.queue.iter().any(RuntimeCommand::is_stop) {
+        if state.stopping {
             return Ok(());
         }
 
@@ -246,6 +257,7 @@ impl CommandReceiver {
         }
     }
 
+    #[cfg(test)]
     fn recv_timeout(
         &self,
         timeout: Duration,
@@ -458,55 +470,84 @@ impl SaitekRemoteManager {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let mut backoff = 1u64;
-        loop {
-            match self.run_connected_session().await {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    error!(
-                        "NATS manager {} disconnected; retrying in {}s: {error:#}",
-                        self.manager_id, backoff
-                    );
-                }
+        self.run_until(shutdown_signal()).await
+    }
+
+    async fn run_until(&self, signal: impl Future<Output = Result<()>>) -> Result<()> {
+        let shutdown = Cancellation::default();
+        let run = retry_sessions(&self.manager_id, &shutdown, || {
+            self.run_connected_session(&shutdown)
+        });
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            result = signal => {
+                info!("Shutting down Saitek manager {}", self.manager_id);
+                shutdown.cancel();
+                // Shutdown remains terminal even when remote cleanup fails.
+                let cleanup = run.await;
+                result.and(cleanup)
             }
-            time::sleep(Duration::from_secs(backoff)).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF_SECS);
+            result = &mut run => result,
         }
     }
 
-    async fn run_connected_session(&self) -> Result<()> {
-        let deckr_runtime = DeckrRuntime::connect(self.nats_url.as_str())
-            .await
-            .with_context(|| format!("connecting manager {} to NATS", self.manager_id))?;
-        info!(
-            "Connected manager {} to NATS at {}",
-            self.manager_id, self.nats_url
-        );
-        info!(
-            "Saitek state maintenance requested cadences: beacon renewal={}s, Concord token refresh={}s, routing reconciliation={}s",
-            self.state_policy.renewal_interval.as_secs(),
-            self.state_policy.concord_token_refresh_interval.as_secs(),
-            self.state_policy.reconcile_interval.as_secs()
-        );
+    async fn run_connected_session(&self, shutdown: &Cancellation) -> Result<()> {
+        let deckr_runtime = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(()),
+            result = DeckrRuntime::connect(self.nats_url.as_str()) => {
+                result.with_context(|| format!("connecting manager {} to NATS", self.manager_id))?
+            }
+        };
+        info!("Connected manager {} to NATS", self.manager_id);
 
         let hardware_handler = Arc::new(SaitekHardwareHandler::default());
         let command_handler: Arc<dyn HardwareCommandHandler> = hardware_handler.clone();
         let reset_handler: Arc<dyn HardwareResetHandler> = hardware_handler.clone();
-        let hardware_runtime = ManagedHardwareRuntime::from_deckr_runtime(
-            &deckr_runtime,
-            self.manager_id.clone(),
-            self.session_id.clone(),
-            BTreeMap::new(),
-            command_handler,
-            Some(reset_handler),
-            self.state_policy.clone(),
-        )
-        .await
-        .context("starting managed Saitek hardware runtime")?;
-        let (supervisor_event_tx, supervisor_event_rx) =
-            tokio_mpsc::unbounded_channel::<WorkerReport>();
-        let (manager_event_tx, manager_event_rx) = tokio_mpsc::unbounded_channel::<WorkerEvent>();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let setup = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => None,
+            result = ManagedHardwareRuntime::from_deckr_runtime(
+                &deckr_runtime,
+                self.manager_id.clone(),
+                self.session_id.clone(),
+                BTreeMap::new(),
+                command_handler,
+                Some(reset_handler),
+                self.state_policy.clone(),
+            ) => Some(result),
+        };
+        let hardware_runtime = match setup {
+            Some(Ok(runtime)) => runtime,
+            result => {
+                deckr_runtime.nats().close_sources().await;
+                return result
+                    .transpose()
+                    .map(|_| ())
+                    .context("starting managed Saitek hardware runtime");
+            }
+        };
+        let mut hardware_tasks = JoinSet::<deckr::Result<()>>::new();
+        let startup = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => None,
+            result = hardware_runtime.start(&mut hardware_tasks) => Some(result),
+        };
+        if !matches!(startup, Some(Ok(()))) {
+            let cleanup = hardware_runtime.stop().await;
+            while hardware_tasks.join_next().await.is_some() {}
+            deckr_runtime.nats().close_sources().await;
+            return startup
+                .transpose()
+                .map(|_| ())
+                .and(cleanup)
+                .context("starting managed Saitek hardware runtime tasks");
+        }
+
+        let (supervisor_event_tx, supervisor_event_rx) = tokio_mpsc::unbounded_channel();
+        let (manager_event_tx, manager_event_rx) = tokio_mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let supervisor = Supervisor::new(
             self.manager_id.clone(),
             self.backend.clone(),
@@ -514,66 +555,99 @@ impl SaitekRemoteManager {
             supervisor_event_rx,
             manager_event_tx,
         );
-
-        let mut supervisor_handle = tokio::spawn(async move { supervisor.run(shutdown_rx).await });
-        let mut hardware_tasks = JoinSet::<deckr::Result<()>>::new();
-        hardware_runtime
-            .start(&mut hardware_tasks)
-            .await
-            .context("starting managed Saitek hardware runtime tasks")?;
+        let mut supervisor_handle = tokio::spawn(supervisor.run(shutdown_rx));
         let mut tasks = JoinSet::<Result<()>>::new();
         tasks.spawn(worker_event_loop(
             hardware_runtime.clone(),
-            hardware_handler.clone(),
+            hardware_handler,
             manager_event_rx,
         ));
 
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("waiting for shutdown signal")?;
-                info!("Shutting down Saitek manager {}", self.manager_id);
-                let _ = shutdown_tx.send(());
-                tasks.abort_all();
-                hardware_tasks.abort_all();
-                let _ = supervisor_handle.await;
-                hardware_runtime.stop().await?;
-                Ok(())
-            }
+        let mut supervisor_finished = false;
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => Ok(()),
             result = &mut supervisor_handle => {
-                tasks.abort_all();
-                hardware_tasks.abort_all();
-                let _ = hardware_runtime.stop().await;
-                result.context("joining device supervisor")??;
-                bail!("device supervisor stopped unexpectedly")
+                supervisor_finished = true;
+                result.context("joining device supervisor")
+                    .and_then(|result| result)
+                    .and_then(|_| Err(anyhow::anyhow!("device supervisor stopped unexpectedly")))
             }
-            result = tasks.join_next() => {
-                let _ = shutdown_tx.send(());
-                tasks.abort_all();
-                hardware_tasks.abort_all();
-                let _ = supervisor_handle.await;
-                let _ = hardware_runtime.stop().await;
-                match result {
-                    Some(Ok(Ok(()))) => bail!("manager runtime task stopped unexpectedly"),
-                    Some(Ok(Err(error))) => Err(error),
-                    Some(Err(error)) => Err(error).context("joining manager runtime task"),
-                    None => bail!("manager runtime tasks stopped unexpectedly"),
-                }
+            result = tasks.join_next() => match result {
+                Some(Ok(Err(error))) => Err(error),
+                Some(Err(error)) => Err(error).context("joining manager runtime task"),
+                _ => Err(anyhow::anyhow!("manager runtime task stopped unexpectedly")),
+            },
+            result = hardware_tasks.join_next() => match result {
+                Some(Ok(Err(error))) => Err(error).context("managed Saitek hardware runtime task"),
+                Some(Err(error)) => Err(error).context("joining managed Saitek hardware runtime task"),
+                _ => Err(anyhow::anyhow!("managed Saitek hardware runtime task stopped unexpectedly")),
+            },
+        };
+        let _ = shutdown_tx.send(());
+        tasks.abort_all();
+        // Revoke protocol authority while the USB workers finish their local resets.
+        // The core owns its task shutdown and bounds remote cleanup independently.
+        let (hardware_cleanup, usb_cleanup) = tokio::join!(hardware_runtime.stop(), async {
+            if supervisor_finished {
+                return Ok(());
             }
-            result = hardware_tasks.join_next() => {
-                let _ = shutdown_tx.send(());
-                tasks.abort_all();
-                hardware_tasks.abort_all();
-                let _ = supervisor_handle.await;
-                let _ = hardware_runtime.stop().await;
-                match result {
-                    Some(Ok(Ok(()))) => bail!("managed Saitek hardware runtime task stopped unexpectedly"),
-                    Some(Ok(Err(error))) => Err(error).context("managed Saitek hardware runtime task"),
-                    Some(Err(error)) => Err(error).context("joining managed Saitek hardware runtime task"),
-                    None => bail!("managed Saitek hardware runtime tasks stopped unexpectedly"),
-                }
-            }
-        }
+            supervisor_handle
+                .await
+                .context("joining device supervisor")?
+        });
+        while tasks.join_next().await.is_some() {}
+        while hardware_tasks.join_next().await.is_some() {}
+        deckr_runtime.nats().close_sources().await;
+        result
+            .and(usb_cleanup)
+            .and(hardware_cleanup.map_err(Into::into))
     }
+}
+
+async fn retry_sessions<F, Fut>(
+    manager_id: &str,
+    shutdown: &Cancellation,
+    mut session: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut backoff = 1u64;
+    while !shutdown.is_cancelled() {
+        match session().await {
+            Ok(()) => return Ok(()),
+            Err(error) if shutdown.is_cancelled() => return Err(error),
+            Err(error) => error!("Manager {manager_id} stopped; retrying in {backoff}s: {error:#}"),
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = time::sleep(Duration::from_secs(backoff)) => {},
+        }
+        backoff = (backoff * 2).min(MAX_BACKOFF_SECS);
+    }
+    Ok(())
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut interrupt = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+        let mut terminate =
+            signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+        tokio::select! {
+            _ = interrupt.recv() => {},
+            _ = terminate.recv() => {},
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for shutdown signal")
 }
 
 async fn worker_event_loop(
@@ -707,6 +781,14 @@ struct Supervisor {
     next_worker_id: u64,
     launched_workers: HashMap<String, LaunchedWorker>,
     active_workers: HashMap<String, ActiveWorker>,
+    workers: Vec<OwnedWorker>,
+}
+
+struct OwnedWorker {
+    worker_id: u64,
+    path_key: String,
+    command_tx: CommandSender,
+    thread: thread::JoinHandle<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -739,19 +821,28 @@ impl Supervisor {
             next_worker_id: 0,
             launched_workers: HashMap::new(),
             active_workers: HashMap::new(),
+            workers: Vec::new(),
         }
     }
 
     async fn run(mut self, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
         let mut discovery = time::interval(DISCOVERY_INTERVAL);
 
-        loop {
+        let result = loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
-                    break;
+                    break Ok(());
                 }
                 _ = discovery.tick() => {
-                    let descriptors = enumerate_canonical(self.backend.clone()).await?;
+                    let descriptors = tokio::select! {
+                        biased;
+                        _ = &mut shutdown_rx => break Ok(()),
+                        result = enumerate_canonical(self.backend.clone()) => match result {
+                            Ok(descriptors) => descriptors,
+                            Err(error) => break Err(error),
+                        }
+                    };
+                    self.reap_finished_workers();
                     self.reconcile_usb_presence(descriptors);
                 }
                 maybe_event = self.worker_rx.recv() => {
@@ -759,10 +850,10 @@ impl Supervisor {
                     self.handle_worker_report(event);
                 }
             }
-        }
+        };
 
-        self.stop_all_workers();
-        Ok(())
+        let cleanup = self.stop_all_workers().await;
+        result.and(cleanup)
     }
 
     fn reconcile_usb_presence(&mut self, descriptors: Vec<DeviceCandidate>) {
@@ -804,6 +895,10 @@ impl Supervisor {
             let path_key = descriptor.path_key();
             if self.active_workers.contains_key(&path_key)
                 || self.launched_workers.contains_key(&path_key)
+                || self
+                    .workers
+                    .iter()
+                    .any(|worker| worker.path_key == path_key)
             {
                 continue;
             }
@@ -811,13 +906,14 @@ impl Supervisor {
             let worker_id = self.next_worker_id;
             let (command_tx, command_rx) = command_channel();
             self.launched_workers.insert(
-                path_key,
+                path_key.clone(),
                 LaunchedWorker {
                     worker_id,
                     command_tx: command_tx.clone(),
                 },
             );
-            spawn_device_worker(
+            let worker_sender = command_tx.clone();
+            let thread = spawn_device_worker(
                 worker_id,
                 self.manager_id.clone(),
                 self.backend.clone(),
@@ -826,6 +922,12 @@ impl Supervisor {
                 command_tx,
                 command_rx,
             );
+            self.workers.push(OwnedWorker {
+                worker_id,
+                path_key,
+                command_tx: worker_sender,
+                thread,
+            });
         }
     }
 
@@ -931,15 +1033,61 @@ impl Supervisor {
         }
     }
 
-    fn stop_all_workers(&mut self) {
+    fn request_stop_all_workers(&self) {
+        for worker in &self.workers {
+            let _ = worker.command_tx.send(RuntimeCommand::Stop);
+        }
         for launched in self.launched_workers.values() {
             let _ = launched.command_tx.send(RuntimeCommand::Stop);
         }
         for active in self.active_workers.values() {
             let _ = active.command_tx.send(RuntimeCommand::Stop);
         }
+    }
+
+    fn reap_finished_workers(&mut self) {
+        let mut index = 0;
+        while index < self.workers.len() {
+            if !self.workers[index].thread.is_finished() {
+                index += 1;
+                continue;
+            }
+            let worker = self.workers.swap_remove(index);
+            if worker.thread.join().is_err() {
+                self.handle_worker_report(WorkerReport::Failed {
+                    worker_id: worker.worker_id,
+                    path_key: worker.path_key,
+                    error: "USB worker panicked".into(),
+                });
+            }
+        }
+    }
+
+    async fn stop_all_workers(&mut self) -> Result<()> {
+        self.request_stop_all_workers();
+        let workers = std::mem::take(&mut self.workers);
+        let result = tokio::task::spawn_blocking(move || {
+            let mut panicked = false;
+            for worker in workers {
+                panicked |= worker.thread.join().is_err();
+            }
+            if panicked {
+                bail!("USB worker panicked during shutdown");
+            }
+            Ok(())
+        })
+        .await
+        .context("joining USB workers")?;
         self.launched_workers.clear();
         self.active_workers.clear();
+        result
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        // Cancellation still requests stop; ordinary exits also await every join.
+        self.request_stop_all_workers();
     }
 }
 
@@ -961,10 +1109,11 @@ fn spawn_device_worker(
     worker_tx: tokio_mpsc::UnboundedSender<WorkerReport>,
     command_tx: CommandSender,
     command_rx: CommandReceiver,
-) {
+) -> thread::JoinHandle<()> {
     let path_key = descriptor.path_key();
+    let device_id = descriptor.hardware_id();
     thread::spawn(move || {
-        if let Err(error) = device_worker(
+        let report = match device_worker(
             backend,
             worker_id,
             manager_id,
@@ -973,13 +1122,19 @@ fn spawn_device_worker(
             command_tx,
             command_rx,
         ) {
-            let _ = worker_tx.send(WorkerReport::Failed {
+            Err(error) => WorkerReport::Failed {
                 worker_id,
                 path_key,
                 error: format!("{error:#}"),
-            });
-        }
-    });
+            },
+            Ok(()) => WorkerReport::Disconnected {
+                worker_id,
+                path_key,
+                device_id,
+            },
+        };
+        let _ = worker_tx.send(report);
+    })
 }
 
 fn device_worker(
@@ -1007,62 +1162,48 @@ fn device_worker(
         probe_reply.request, probe_reply.header_error, probe_reply.request_error
     );
 
-    worker_tx
+    if worker_tx
         .send(WorkerReport::Connected {
             worker_id,
             path_key: path_key.clone(),
             device_id: local_device_id.clone(),
-            command_tx: command_tx.clone(),
+            command_tx,
             device: Box::new(device_descriptor(
                 &runtime_descriptor,
                 &local_device_id,
                 &fingerprint,
             )),
         })
-        .ok();
+        .is_err()
+    {
+        return reset_device(&mut *handle);
+    }
 
     let mut previous_mask = 0u16;
     loop {
-        while let Ok(command) = command_rx.try_recv() {
-            if matches!(command, RuntimeCommand::Stop) {
-                let _ = reset_device(&mut *handle);
-                return Ok(());
-            }
-            if let Err(error) = apply_runtime_command(&mut *handle, command) {
-                let _ = worker_tx.send(WorkerReport::Disconnected {
-                    worker_id,
-                    path_key: path_key.clone(),
-                    device_id: local_device_id.clone(),
-                });
-                return Err(error);
-            }
-        }
-
-        match command_rx.recv_timeout(Duration::from_millis(0)) {
-            Ok(RuntimeCommand::Stop) => {
-                let _ = reset_device(&mut *handle);
-                return Ok(());
-            }
-            Ok(command) => {
-                if let Err(error) = apply_runtime_command(&mut *handle, command) {
-                    let _ = worker_tx.send(WorkerReport::Disconnected {
-                        worker_id,
-                        path_key: path_key.clone(),
-                        device_id: local_device_id.clone(),
-                    });
-                    return Err(error);
+        let mut outputs = 0;
+        for _ in 0..OUTPUT_BATCH_SIZE {
+            match command_rx.try_recv() {
+                Ok(RuntimeCommand::Stop) | Err(TryRecvError::Disconnected) => {
+                    return reset_device(&mut *handle);
                 }
+                Ok(command) => {
+                    // The wrapper reports one Failed transition, preserving its cause.
+                    apply_runtime_command(&mut *handle, command)?;
+                    outputs += 1;
+                }
+                Err(TryRecvError::Empty) => break,
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                let _ = reset_device(&mut *handle);
-                return Ok(());
-            }
-            Err(RecvTimeoutError::Timeout) => {}
         }
 
-        let Some(report) = handle.read_hid_report(READ_TIMEOUT)? else {
+        let read_timeout = if outputs > 0 {
+            BUSY_READ_TIMEOUT
+        } else {
+            READ_TIMEOUT
+        };
+        let Some(report) = handle.read_hid_report(read_timeout)? else {
             if !handle.has_hid_input() {
-                thread::sleep(READ_TIMEOUT);
+                thread::sleep(read_timeout);
             }
             continue;
         };
@@ -1130,6 +1271,7 @@ fn apply_hardware_output(
         HardwareOutput::SetLed { control_id, on } => {
             let index = led_index(&control_id).context("unknown LED control")?;
             handle.set_led(DEFAULT_PAGE_ID, index, on)?;
+            tracing::trace!(%control_id, on, "USB lamp output completed");
         }
         HardwareOutput::SetRasterFrame {
             control_id,
@@ -1149,6 +1291,7 @@ fn apply_hardware_output(
                 return Ok(());
             }
             handle.send_image(&frame, DEFAULT_PAGE_ID)?;
+            tracing::trace!(%control_id, "USB raster frame completed");
         }
         HardwareOutput::ClearRaster { control_id } => {
             if control_id != SCREEN_CONTROL_ID {
@@ -1156,6 +1299,7 @@ fn apply_hardware_output(
                 return Ok(());
             }
             handle.clear_image(DEFAULT_PAGE_ID)?;
+            tracing::trace!(%control_id, "USB raster clear completed");
         }
     }
     Ok(())
@@ -1916,6 +2060,8 @@ mod tests {
             command_rx.try_recv().unwrap(),
             RuntimeCommand::Stop
         ));
+        // A reset racing with shutdown must not revive the drained queue.
+        command_tx.send(RuntimeCommand::ResetDevice).unwrap();
         assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
         stop_managed_runtime(&h, tasks).await;
     }
@@ -2131,7 +2277,7 @@ mod tests {
             other => panic!("expected routed control input, got {other:?}"),
         }
 
-        supervisor.stop_all_workers();
+        supervisor.stop_all_workers().await.unwrap();
         stop_managed_runtime(&h, tasks).await;
     }
 
@@ -2541,5 +2687,355 @@ mod tests {
 
         assert_eq!(backend.commands(), [REQ_SET_IMAGE]);
         assert_eq!(backend.sent_frames()[0].len(), crate::protocol::FRAME_BYTES);
+    }
+    struct EnumerationFailure;
+    impl Backend for EnumerationFailure {
+        fn enumerate(&self) -> Result<Vec<DeviceCandidate>> {
+            bail!("injected enumeration failure")
+        }
+        fn open(&self, _: &DeviceCandidate, _: Duration) -> Result<Box<dyn DeviceHandle>> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn enumeration_failure_stops_existing_worker() {
+        let (worker_tx, worker_rx) = tokio_mpsc::unbounded_channel();
+        let (manager_tx, _manager_rx) = tokio_mpsc::unbounded_channel();
+        let mut supervisor = Supervisor::new(
+            "test".into(),
+            Arc::new(EnumerationFailure),
+            worker_tx,
+            worker_rx,
+            manager_tx,
+        );
+        let (command_tx, command_rx) = command_channel();
+        // External senders can outlive the supervisor, so disconnect is insufficient.
+        let _worker_owned_sender = command_tx.clone();
+        supervisor.active_workers.insert(
+            "path".into(),
+            ActiveWorker {
+                worker_id: 1,
+                device_id: "fip".into(),
+                command_tx,
+            },
+        );
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        assert!(supervisor.run(shutdown_rx).await.is_err());
+        assert!(
+            matches!(command_rx.try_recv(), Ok(RuntimeCommand::Stop)),
+            "enumeration failure left the worker running without a Stop command"
+        );
+    }
+
+    struct ReplenishingHandle {
+        fail_on_output: bool,
+        sender: CommandSender,
+        output: RuntimeCommand,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl DeviceHandle for ReplenishingHandle {
+        fn has_hid_input(&self) -> bool {
+            true
+        }
+        fn probe(&mut self) -> Result<FipControlPacket> {
+            Ok(FipControlPacket::default())
+        }
+        fn clear_image(&mut self, _: u32) -> Result<FipControlPacket> {
+            Ok(FipControlPacket::default())
+        }
+        fn send_image(&mut self, _: &[u8], _: u32) -> Result<FipControlPacket> {
+            unreachable!()
+        }
+        fn set_led(&mut self, _: u32, _: u32, on: bool) -> Result<FipControlPacket> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if on {
+                if self.fail_on_output {
+                    bail!("injected USB bulk OUT failure");
+                }
+                let count = self.writes.fetch_add(1, SeqCst) + 1;
+                self.sender
+                    .send(if count < 64 {
+                        self.output.clone()
+                    } else {
+                        RuntimeCommand::Stop
+                    })
+                    .unwrap();
+            }
+            Ok(FipControlPacket::default())
+        }
+        fn read_hid_report(&mut self, _: Duration) -> Result<Option<Vec<u8>>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(vec![1, 0]))
+        }
+    }
+    struct ReplenishingBackend {
+        handle: StdMutex<Option<ReplenishingHandle>>,
+    }
+    impl Backend for ReplenishingBackend {
+        fn enumerate(&self) -> Result<Vec<DeviceCandidate>> {
+            Ok(vec![sample_candidate()])
+        }
+        fn open(&self, _: &DeviceCandidate, _: Duration) -> Result<Box<dyn DeviceHandle>> {
+            Ok(Box::new(self.handle.lock().unwrap().take().unwrap()))
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_outputs_do_not_starve_hid() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (h, tasks, _, rx, _) = output_harness().await;
+        let RuntimeCommand::Hardware(template) = queued_output(&h, &rx, "claim-a", "clear").await
+        else {
+            unreachable!()
+        };
+        let (sender, receiver) = command_channel();
+        let output = RuntimeCommand::Hardware(AuthorizedOutput {
+            context: template.context,
+            output: HardwareOutput::SetLed {
+                control_id: "s1".into(),
+                on: true,
+            },
+        });
+        sender.send(output.clone()).unwrap();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(ReplenishingBackend {
+            handle: StdMutex::new(Some(ReplenishingHandle {
+                fail_on_output: false,
+                sender: sender.clone(),
+                output,
+                writes: writes.clone(),
+                reads: reads.clone(),
+            })),
+        });
+        let (reports, _rx) = tokio_mpsc::unbounded_channel();
+        tokio::task::spawn_blocking(move || {
+            device_worker(
+                backend,
+                1,
+                "saitek-main".into(),
+                sample_candidate(),
+                reports,
+                sender,
+                receiver,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        stop_managed_runtime(&h, tasks).await;
+        assert_eq!(writes.load(SeqCst), 64);
+        assert!(
+            reads.load(SeqCst) > 0,
+            "64 consecutive outputs completed without a single HID read"
+        );
+    }
+
+    struct BlockingReadState {
+        entered: std::sync::atomic::AtomicBool,
+        release: std::sync::atomic::AtomicBool,
+        dropped: std::sync::atomic::AtomicBool,
+    }
+    struct BlockingReadHandle(Arc<BlockingReadState>);
+    impl Drop for BlockingReadHandle {
+        fn drop(&mut self) {
+            self.0
+                .dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl DeviceHandle for BlockingReadHandle {
+        fn has_hid_input(&self) -> bool {
+            true
+        }
+        fn probe(&mut self) -> Result<FipControlPacket> {
+            Ok(FipControlPacket::default())
+        }
+        fn clear_image(&mut self, _: u32) -> Result<FipControlPacket> {
+            Ok(FipControlPacket::default())
+        }
+        fn send_image(&mut self, _: &[u8], _: u32) -> Result<FipControlPacket> {
+            Ok(FipControlPacket::default())
+        }
+        fn set_led(&mut self, _: u32, _: u32, _: bool) -> Result<FipControlPacket> {
+            Ok(FipControlPacket::default())
+        }
+        fn read_hid_report(&mut self, _: Duration) -> Result<Option<Vec<u8>>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.0.entered.store(true, SeqCst);
+            while !self.0.release.load(SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(None)
+        }
+    }
+    struct BlockingReadBackend(Arc<BlockingReadState>);
+    impl Backend for BlockingReadBackend {
+        fn enumerate(&self) -> Result<Vec<DeviceCandidate>> {
+            Ok(vec![sample_candidate()])
+        }
+        fn open(&self, _: &DeviceCandidate, _: Duration) -> Result<Box<dyn DeviceHandle>> {
+            Ok(Box::new(BlockingReadHandle(self.0.clone())))
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_shutdown_waits_for_usb_handle_release() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let state = Arc::new(BlockingReadState {
+            entered: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+            dropped: AtomicBool::new(false),
+        });
+        let (worker_tx, worker_rx) = tokio_mpsc::unbounded_channel();
+        let (manager_tx, _manager_rx) = tokio_mpsc::unbounded_channel();
+        let mut supervisor = Supervisor::new(
+            "test".into(),
+            Arc::new(BlockingReadBackend(state.clone())),
+            worker_tx,
+            worker_rx,
+            manager_tx,
+        );
+        supervisor.reconcile_usb_presence(vec![sample_candidate()]);
+        while !state.entered.load(SeqCst) {
+            time::sleep(Duration::from_millis(1)).await;
+        }
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        shutdown_tx.send(()).unwrap();
+        let stopping = tokio::spawn(supervisor.run(shutdown_rx));
+        time::sleep(Duration::from_millis(20)).await;
+        let returned_early = stopping.is_finished();
+        state.release.store(true, SeqCst);
+        stopping.await.unwrap().unwrap();
+        time::timeout(Duration::from_secs(1), async {
+            while !state.dropped.load(SeqCst) {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !returned_early,
+            "supervisor returned while USB worker still held its device handle"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usb_output_failure_reports_disconnect_and_cause_once() {
+        use std::sync::atomic::AtomicUsize;
+        let (h, tasks, _, rx, _) = output_harness().await;
+        let RuntimeCommand::Hardware(template) = queued_output(&h, &rx, "claim-a", "clear").await
+        else {
+            unreachable!()
+        };
+        let (sender, receiver) = command_channel();
+        let output = RuntimeCommand::Hardware(AuthorizedOutput {
+            context: template.context,
+            output: HardwareOutput::SetLed {
+                control_id: "s1".into(),
+                on: true,
+            },
+        });
+        sender.send(output.clone()).unwrap();
+        let backend = Arc::new(ReplenishingBackend {
+            handle: StdMutex::new(Some(ReplenishingHandle {
+                fail_on_output: true,
+                sender: sender.clone(),
+                output,
+                writes: Arc::new(AtomicUsize::new(0)),
+                reads: Arc::new(AtomicUsize::new(0)),
+            })),
+        });
+        let (reports, mut report_rx) = tokio_mpsc::unbounded_channel();
+        let worker = spawn_device_worker(
+            7,
+            "saitek-main".into(),
+            backend,
+            sample_candidate(),
+            reports,
+            sender.clone(),
+            receiver,
+        );
+        let (mut supervisor, mut manager_rx) = supervisor_for_tests();
+        supervisor.launched_workers.insert(
+            sample_candidate().path_key(),
+            LaunchedWorker {
+                worker_id: 7,
+                command_tx: sender,
+            },
+        );
+        supervisor.handle_worker_report(recv_worker_report(&mut report_rx).await);
+        assert!(matches!(
+            manager_rx.try_recv(),
+            Ok(WorkerEvent::Connected { .. })
+        ));
+        supervisor.handle_worker_report(recv_worker_report(&mut report_rx).await);
+        worker.join().unwrap();
+        assert_next_disconnected(
+            &mut manager_rx,
+            &sample_candidate().path_key(),
+            &sample_candidate().hardware_id(),
+        );
+        let WorkerEvent::Failed { error, .. } = manager_rx.try_recv().unwrap() else {
+            panic!("missing failure cause")
+        };
+        assert!(error.contains("injected USB bulk OUT failure"));
+        assert!(report_rx.try_recv().is_err());
+        assert!(manager_rx.try_recv().is_err());
+        stop_managed_runtime(&h, tasks).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_error_does_not_start_another_session() {
+        let shutdown = Cancellation::default();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result = retry_sessions("test", &shutdown, || async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            shutdown.cancel();
+            bail!("injected cleanup timeout")
+        })
+        .await;
+        assert!(result.unwrap_err().to_string().contains("cleanup timeout"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_retry_backoff() {
+        let shutdown = Cancellation::default();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let retry = retry_sessions("test", &shutdown, || async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            bail!("injected session failure")
+        });
+        let cancel = async {
+            time::sleep(Duration::from_millis(10)).await;
+            shutdown.cancel();
+        };
+        let (result, ()) = time::timeout(Duration::from_millis(500), async {
+            tokio::join!(retry, cancel)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_initial_connection() {
+        let manager = SaitekRemoteManager::with_backend(
+            "nats://127.0.0.1:1".into(),
+            "test".into(),
+            Arc::new(FakeBackend::new()),
+        );
+        time::timeout(
+            Duration::from_secs(1),
+            manager.run_until(async {
+                time::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
 }

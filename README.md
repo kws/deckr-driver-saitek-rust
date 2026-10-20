@@ -35,6 +35,22 @@ identity, session, or deadline is no longer valid are discarded without
 disconnecting the device. LED commands use the same authorization context.
 Startup clears all lamps; local reset and stop clear the lamps and screen.
 
+SIGINT and SIGTERM stop the manager during startup, normal operation, or retry
+backoff. Shutdown revokes Concord authority and waits for every USB worker to
+finish its reset and release its interfaces. A remote cleanup failure is reported
+on exit and never starts another session. Enumeration failures also stop and join
+existing workers before retrying.
+
+After an unclean exit, the core can hold startup until a previous session's
+participant token expires. Recovery negotiates a successor contract; it never
+reattaches to the old agreement.
+
+USB output runs in batches of at most four commands before checking HID input,
+so a continuous stream of frames cannot starve buttons and encoders. Each USB
+command has one five-second deadline covering its header, payload, and reply.
+Worker failures retain the underlying USB error in the log. A failed interface
+claim restores any kernel driver detached during that attempt.
+
 ### Button lamps
 
 Controls `s1`–`s6`, `up`, and `down` expose the manager-owned extension capability
@@ -71,8 +87,9 @@ Environment variables:
 
 - `DECKR_MANAGER_ID` (optional; overrides the `saitek-rust-<hostname>` default)
 - `DECKR_NATS_URL`
-- `DECKR_CONCORD_TOKEN_REFRESH_SECONDS` (optional requested cadence; defaults to `60`)
 - `DECKR_STATE_RECONCILE_SECONDS` (optional; defaults to `300`)
+
+Concord participant-token renewal timing is managed by the Rust core.
 
 ## Linux USB Access
 
@@ -178,6 +195,10 @@ tar -xzf deckr-saitek-manager-openwrt-24.10.4-bcm2708-pi1.tar.gz
 The build stages a static `libusb` archive with the OpenWrt toolchain and fails
 if the produced binary references glibc, such as `/lib/ld-linux-armhf.so.3` or
 `libc.so.6`. The expected Pi 1 artifact is a statically linked ARM EABI5 binary.
+The raw binary also runs on OpenWrt 25.12.4; that release uses `apk`, so the
+`opkg` package command above applies to OpenWrt 24.10. For a procd service, set
+`procd_set_param term_timeout 60` so USB reset and Concord cleanup can finish
+before the supervisor forces termination.
 
 ## GitHub Actions
 
