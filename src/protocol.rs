@@ -124,7 +124,8 @@ pub fn clear_image_packet(page: u32) -> FipControlPacket {
 }
 
 pub fn set_led_packet(page: u32, index: u32, value: bool) -> FipControlPacket {
-    fip_packet(REQ_SET_LED, 0, 0, 0, page, index, u32::from(value))
+    // Word 1 is the running flag, as for SetImage; word 6 carries the gauge ID.
+    fip_packet(REQ_SET_LED, 1, 0, 0, page, index, u32::from(value))
 }
 
 pub fn validate_frame_size(frame: &[u8]) -> Result<()> {
@@ -390,5 +391,13 @@ mod tests {
     #[test]
     fn unknown_hid_bits_returns_unmapped_bits_only() {
         assert_eq!(unknown_hid_bits(0x00f0 | 0x0100), 0x00f0);
+    }
+    #[test]
+    fn s6_led_packet_has_running_flag_and_lamp_fields() {
+        assert_eq!(
+            set_led_packet(1, 6, true).as_words(),
+            [0, 1, 0, 0, 0, 0x18, 1, 6, 1, 0, 0]
+        );
+        assert_eq!(set_led_packet(1, 6, false).as_words()[8], 0);
     }
 }

@@ -9,6 +9,8 @@ use crate::protocol::{HidEvent, HEIGHT, WIDTH};
 
 pub const SCREEN_CONTROL_ID: &str = "screen";
 pub const RASTER_CAPABILITY_ID: &str = "raster.bitmap";
+pub const LED_CAPABILITY_ID: &str = "led.binary";
+pub const LED_FAMILY: &str = "io.github.kws.saitek.output.led";
 pub const BUTTON_MOMENTARY_CAPABILITY_ID: &str = "button.momentary";
 pub const ENCODER_RELATIVE_CAPABILITY_ID: &str = "encoder.relative";
 pub const DEFAULT_PAGE_ID: u32 = 1;
@@ -66,28 +68,32 @@ pub fn control_descriptors(input_enabled: bool) -> Vec<ControlDescriptor> {
         ..Default::default()
     }];
 
-    if input_enabled {
-        controls.extend(
-            BUTTON_CONTROLS
-                .iter()
-                .map(|(id, label, x, y)| ControlDescriptor {
-                    control_id: (*id).to_string(),
-                    kind: "button".to_string(),
-                    label: Some((*label).to_string()),
-                    geometry: Some(ControlGeometry {
-                        x: *x,
-                        y: *y,
-                        width: Some(1.0),
-                        height: Some(1.0),
-                        unit: "grid".to_string(),
-                        ..Default::default()
-                    }),
-                    input_capabilities: vec![button_momentary_capability()],
-                    output_capabilities: Vec::new(),
+    controls.extend(
+        BUTTON_CONTROLS
+            .iter()
+            .map(|(id, label, x, y)| ControlDescriptor {
+                control_id: (*id).to_string(),
+                kind: "button".to_string(),
+                label: Some((*label).to_string()),
+                geometry: Some(ControlGeometry {
+                    x: *x,
+                    y: *y,
+                    width: Some(1.0),
+                    height: Some(1.0),
+                    unit: "grid".to_string(),
                     ..Default::default()
                 }),
-        );
+                input_capabilities: if input_enabled {
+                    vec![button_momentary_capability()]
+                } else {
+                    Vec::new()
+                },
+                output_capabilities: vec![led_output_capability()],
+                ..Default::default()
+            }),
+    );
 
+    if input_enabled {
         controls.extend([
             ControlDescriptor {
                 control_id: "left_encoder".to_string(),
@@ -125,6 +131,41 @@ pub fn control_descriptors(input_enabled: bool) -> Vec<ControlDescriptor> {
     }
 
     controls
+}
+
+pub fn led_index(control_id: &str) -> Option<u32> {
+    match control_id {
+        "s1" => Some(1),
+        "s2" => Some(2),
+        "s3" => Some(3),
+        "s4" => Some(4),
+        "s5" => Some(5),
+        "s6" => Some(6),
+        "up" => Some(7),
+        "down" => Some(8),
+        _ => None,
+    }
+}
+
+fn led_output_capability() -> CapabilityDescriptor {
+    CapabilityDescriptor {
+        capability_id: LED_CAPABILITY_ID.to_string(),
+        family: LED_FAMILY.to_string(),
+        capability_type: "binary".to_string(),
+        direction: "output".to_string(),
+        access: vec!["settable".to_string()],
+        command_types: vec!["set".to_string()],
+        command_schema: Some(capability_schema(
+            "io.github.kws.saitek.command.output.led.binary.v1",
+            json!({
+                "type": "object",
+                "required": ["on"],
+                "properties": {"on": {"type": "boolean"}},
+                "additionalProperties": false
+            }),
+        )),
+        ..Default::default()
+    }
 }
 
 pub fn translate_hid_event(
@@ -396,19 +437,28 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_exposes_display_only_when_hid_is_unavailable() {
+    fn descriptor_exposes_display_and_leds_when_hid_is_unavailable() {
         let descriptor = device_descriptor(
             &sample_candidate().without_hid_input(),
             "fip",
             "fingerprint",
         );
 
-        assert_eq!(descriptor.controls.len(), 1);
+        assert_eq!(descriptor.controls.len(), 9);
         assert_eq!(descriptor.controls[0].control_id, SCREEN_CONTROL_ID);
-        assert!(!descriptor
+        assert!(descriptor
             .controls
             .iter()
-            .any(|control| control.control_id == "s1"));
+            .all(|control| control.input_capabilities.is_empty()));
+        let button = descriptor
+            .controls
+            .iter()
+            .find(|control| control.control_id == "s6")
+            .unwrap();
+        assert_eq!(button.output_capabilities[0].family, LED_FAMILY);
+        assert_eq!(button.output_capabilities[0].command_types, ["set"]);
+        assert_eq!(led_index("s6"), Some(6));
+        assert_eq!(led_index("screen"), None);
         assert!(!descriptor
             .controls
             .iter()

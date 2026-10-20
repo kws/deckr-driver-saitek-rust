@@ -32,7 +32,27 @@ Concord hardware-claim contracts and participant tokens. Queued display commands
 retain the core authorization context and recheck it before execution and after
 image conversion, immediately before USB output. Commands whose claim, device
 identity, session, or deadline is no longer valid are discarded without
-disconnecting the device. Local reset and stop commands still clear the screen.
+disconnecting the device. LED commands use the same authorization context.
+Startup clears all lamps; local reset and stop clear the lamps and screen.
+
+### Button lamps
+
+Controls `s1`–`s6`, `up`, and `down` expose the manager-owned extension capability
+`led.binary`, family `io.github.kws.saitek.output.led`, type `binary`, direction
+`output`, access `settable`. Command `set` takes exactly `{"on": true}` or
+`{"on": false}`; its inline schema is labelled
+`io.github.kws.saitek.command.output.led.binary.v1`. No colour or brightness
+control is available. Lamp output remains available when HID input cannot be
+claimed. Controllers match the family/type and target the advertised capability ID.
+
+The USB command is `0x18`, with lamp indices 1–6 for S1–S6, 7 for Up and 8 for
+Down, and state 0/1. Word 1 carries the running flag (1), word 6 the gauge ID,
+word 7 the lamp index, and word 8 the state. This layout and numbering are
+cross-checked against the independent
+[FIP implementation](https://github.com/JasonCarlyle/saitek-fip-macos/blob/main/fipx/device.py).
+Pending outputs coalesce per control, so an old blink sequence cannot build up
+behind a slow display transfer. Reset takes priority and drops pending outputs;
+dequeued commands still recheck their original Concord authority.
 
 ```sh
 deckr-saitek-manager \

@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use crate::backend::{Backend, DeviceCandidate, DeviceHandle, UsbBackend};
 use crate::descriptor::{
-    device_descriptor, translate_hid_event, DEFAULT_PAGE_ID, RASTER_CAPABILITY_ID,
-    SCREEN_CONTROL_ID,
+    device_descriptor, led_index, translate_hid_event, DEFAULT_PAGE_ID, LED_CAPABILITY_ID,
+    RASTER_CAPABILITY_ID, SCREEN_CONTROL_ID,
 };
 use crate::image::encoded_image_to_fip_frame;
 use crate::protocol::{changed_events, decode_hid_mask, ByteOrder};
@@ -41,6 +41,10 @@ type ManagedNatsHardwareRuntime =
 
 #[derive(Debug, Clone)]
 enum HardwareOutput {
+    SetLed {
+        control_id: String,
+        on: bool,
+    },
     SetRasterFrame {
         control_id: String,
         encoding: String,
@@ -92,11 +96,12 @@ impl RuntimeCommand {
         )
     }
 
-    fn raster_control_id(&self) -> Option<&str> {
+    fn output_control_id(&self) -> Option<&str> {
         match self {
             Self::Hardware(AuthorizedOutput { output, .. }) => match output {
                 HardwareOutput::SetRasterFrame { control_id, .. }
-                | HardwareOutput::ClearRaster { control_id } => Some(control_id),
+                | HardwareOutput::ClearRaster { control_id }
+                | HardwareOutput::SetLed { control_id, .. } => Some(control_id),
             },
             _ => None,
         }
@@ -275,8 +280,8 @@ impl CommandReceiver {
 }
 
 fn enqueue_bounded_command(queue: &mut VecDeque<RuntimeCommand>, command: RuntimeCommand) {
-    if let Some(control_id) = command.raster_control_id().map(ToOwned::to_owned) {
-        queue.retain(|queued| queued.raster_control_id() != Some(control_id.as_str()));
+    if let Some(control_id) = command.output_control_id().map(ToOwned::to_owned) {
+        queue.retain(|queued| queued.output_control_id() != Some(control_id.as_str()));
     }
     while queue.len() >= COMMAND_QUEUE_CAPACITY {
         if let Some(index) = queue.iter().position(RuntimeCommand::is_raster_frame) {
@@ -614,6 +619,26 @@ async fn worker_event_loop(
 
 fn hardware_output_from_body(body: HardwareMessageBody) -> Result<HardwareOutput> {
     match body {
+        HardwareMessageBody::ControlCommand {
+            control_id,
+            capability_id,
+            command_type,
+            params,
+            ..
+        } if capability_id == LED_CAPABILITY_ID && command_type == "set" => {
+            let control_id = control_id.context("LED set requires controlId")?;
+            if led_index(&control_id).is_none() {
+                bail!("unknown LED control {control_id}");
+            }
+            let on = params
+                .get("on")
+                .and_then(|value| value.as_bool())
+                .context("LED set requires boolean on")?;
+            if params.len() != 1 {
+                bail!("LED set only accepts on");
+            }
+            Ok(HardwareOutput::SetLed { control_id, on })
+        }
         HardwareMessageBody::ControlCommand {
             control_id,
             capability_id,
@@ -976,6 +1001,7 @@ fn device_worker(
         descriptor.without_hid_input()
     };
     let probe_reply = handle.probe()?;
+    clear_leds(&mut *handle)?;
     debug!(
         "Saitek FIP probe reply request=0x{:02x} header_error=0x{:08x} request_error=0x{:08x}",
         probe_reply.request, probe_reply.header_error, probe_reply.request_error
@@ -999,7 +1025,7 @@ fn device_worker(
     loop {
         while let Ok(command) = command_rx.try_recv() {
             if matches!(command, RuntimeCommand::Stop) {
-                let _ = handle.clear_image(DEFAULT_PAGE_ID);
+                let _ = reset_device(&mut *handle);
                 return Ok(());
             }
             if let Err(error) = apply_runtime_command(&mut *handle, command) {
@@ -1014,7 +1040,7 @@ fn device_worker(
 
         match command_rx.recv_timeout(Duration::from_millis(0)) {
             Ok(RuntimeCommand::Stop) => {
-                let _ = handle.clear_image(DEFAULT_PAGE_ID);
+                let _ = reset_device(&mut *handle);
                 return Ok(());
             }
             Ok(command) => {
@@ -1028,7 +1054,7 @@ fn device_worker(
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
-                let _ = handle.clear_image(DEFAULT_PAGE_ID);
+                let _ = reset_device(&mut *handle);
                 return Ok(());
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -1067,10 +1093,26 @@ fn apply_runtime_command(handle: &mut dyn DeviceHandle, command: RuntimeCommand)
             apply_hardware_output(handle, output, || context.authorize())?;
         }
         RuntimeCommand::ResetDevice => {
-            handle.clear_image(DEFAULT_PAGE_ID)?;
+            reset_device(handle)?;
         }
         RuntimeCommand::Stop => {}
     }
+    Ok(())
+}
+
+fn clear_leds(handle: &mut dyn DeviceHandle) -> Result<()> {
+    for index in 1..=8 {
+        handle.set_led(DEFAULT_PAGE_ID, index, false)?;
+    }
+    Ok(())
+}
+
+fn reset_device(handle: &mut dyn DeviceHandle) -> Result<()> {
+    // Try both even when one reset fails.
+    let leds = clear_leds(handle);
+    let screen = handle.clear_image(DEFAULT_PAGE_ID);
+    leds?;
+    screen?;
     Ok(())
 }
 
@@ -1085,6 +1127,10 @@ fn apply_hardware_output(
         return Ok(());
     }
     match output {
+        HardwareOutput::SetLed { control_id, on } => {
+            let index = led_index(&control_id).context("unknown LED control")?;
+            handle.set_led(DEFAULT_PAGE_ID, index, on)?;
+        }
         HardwareOutput::SetRasterFrame {
             control_id,
             encoding,
@@ -1399,6 +1445,7 @@ mod tests {
         reports: VecDeque<Vec<u8>>,
         sent_frames: Vec<Vec<u8>>,
         commands: Vec<u32>,
+        leds: Vec<(u32, u32, bool)>,
     }
 
     impl FakeBackend {
@@ -1409,6 +1456,7 @@ mod tests {
                     reports: VecDeque::new(),
                     sent_frames: Vec::new(),
                     commands: Vec::new(),
+                    leds: Vec::new(),
                 })),
                 open_count: Arc::new(StdMutex::new(0)),
             }
@@ -1503,7 +1551,8 @@ mod tests {
             })
         }
 
-        fn set_led(&mut self, _page: u32, _index: u32, _value: bool) -> Result<FipControlPacket> {
+        fn set_led(&mut self, page: u32, index: u32, value: bool) -> Result<FipControlPacket> {
+            self.state.lock().unwrap().leds.push((page, index, value));
             Ok(FipControlPacket::default())
         }
 
@@ -1548,6 +1597,102 @@ mod tests {
             device_ref.fingerprint = Some(device_id.to_string());
         }
         body
+    }
+
+    fn led_command(control: &str, on: serde_json::Value) -> HardwareMessageBody {
+        let mut body = raster_command("clear");
+        if let HardwareMessageBody::ControlCommand {
+            control_id,
+            capability_id,
+            command_type,
+            params,
+            ..
+        } = &mut body
+        {
+            *control_id = Some(control.to_string());
+            *capability_id = LED_CAPABILITY_ID.to_string();
+            *command_type = "set".to_string();
+            params.insert("on".into(), on);
+        }
+        body
+    }
+
+    #[test]
+    fn led_commands_require_a_real_lamp_and_boolean_state() {
+        assert!(hardware_output_from_body(led_command("s6", serde_json::json!(true))).is_ok());
+        for body in [
+            led_command("screen", serde_json::json!(true)),
+            led_command("s6", serde_json::json!(1)),
+            led_command("s6", serde_json::json!("true")),
+        ] {
+            assert!(hardware_output_from_body(body).is_err());
+        }
+    }
+
+    async fn queued_led(
+        h: &ManagedHarness,
+        command_rx: &CommandReceiver,
+        contract_id: &str,
+        on: bool,
+    ) -> RuntimeCommand {
+        h.lane.publish_inbound(
+            DeckrMessage::hardware_command(
+                "main",
+                "controller-session",
+                "saitek-main",
+                "manager-session",
+                "fip",
+                contract_pointer(contract_id),
+                led_command("s6", serde_json::json!(on)),
+            )
+            .unwrap(),
+        );
+        wait_for_runtime_command(command_rx, "LED output", |command| {
+            matches!(command, RuntimeCommand::Hardware(_))
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn led_output_is_fenced_and_reset_turns_lamps_off() {
+        let (h, tasks, command_tx, command_rx, first) = output_harness().await;
+        let on = queued_led(&h, &command_rx, "claim-a", true).await;
+        let backend = FakeBackend::new();
+        let mut handle = FakeHandle {
+            state: backend.device.clone(),
+        };
+        apply_runtime_command(&mut handle, on.clone()).unwrap();
+        assert_eq!(
+            backend.device.lock().unwrap().leds,
+            [(DEFAULT_PAGE_ID, 6, true)]
+        );
+        h.concord
+            .cancel(
+                &first,
+                &EndpointAddress::parse("controller:main").unwrap(),
+                Some("done".into()),
+            )
+            .await
+            .unwrap();
+        let reset = wait_for_runtime_command(&command_rx, "reset", RuntimeCommand::is_reset);
+        apply_runtime_command(&mut handle, reset).unwrap();
+        create_claim(&h.concord, "claim-b", "fip", Some("fingerprint:fip")).await;
+        apply_runtime_command(&mut handle, on).unwrap();
+        assert_eq!(backend.device.lock().unwrap().leds.len(), 9);
+        assert!(backend.device.lock().unwrap().leds[1..]
+            .iter()
+            .all(|(_, _, on)| !on));
+
+        let new_on = queued_led(&h, &command_rx, "claim-b", true).await;
+        let new_off = queued_led(&h, &command_rx, "claim-b", false).await;
+        command_tx.send(new_on).unwrap();
+        command_tx.send(new_off).unwrap();
+        apply_runtime_command(&mut handle, command_rx.try_recv().unwrap()).unwrap();
+        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            backend.device.lock().unwrap().leds.last(),
+            Some(&(DEFAULT_PAGE_ID, 6, false))
+        );
+        stop_managed_runtime(&h, tasks).await;
     }
 
     fn contract_pointer(contract_id: &str) -> ContractPointer {
