@@ -227,27 +227,25 @@ Linux Intel, Raspberry Pi, macOS, and OpenWrt Raspberry Pi 1 targets. Pushing a
 tag that starts with `v`, such as `v0.1.0`, packages the binaries and creates
 or updates the matching GitHub Release.
 
-The workflow checks out the sibling `kws/deckr-core-rust` repository because this
-crate uses the local Deckr Rust core path dependency. If the current branch or tag
-exists in `kws/deckr-core-rust`, the workflow uses it; otherwise it uses the core
-repository's default branch. Set the repository variable `DECKR_REF` to force a specific Deckr branch,
-tag, or 40-character commit SHA. For private repository access, add a
-`DECKR_REPO_TOKEN` secret with read access to `kws/deckr-core-rust`.
+CI checks out `kws/deckr-core-rust` at `.deckr-core-revision` for every build.
+Private repository access uses `DECKR_REPO_TOKEN` with read access to that core.
 
-## Release Flow
+Ordinary alpha development updates Git commits and dependency pins without
+changing package versions or creating release tags. Releases require a separate
+explicit release request.
 
-Driver releases are made from a release commit that pins the workflow to the
-exact Deckr commit used for the build. This keeps the release reproducible even
-when the driver tag does not exist in the upstream `kws/deckr-core-rust` repository.
+## Shared core dependency
 
-1. Choose the Deckr commit SHA to release against.
-2. Update `version` in `Cargo.toml` and `Cargo.lock`.
-3. Replace every workflow `DECKR_REF` expression with the chosen 40-character
-   Deckr SHA.
-4. Run formatting, clippy, and tests.
-5. Commit the change as `Release vX.Y.Z`.
-6. Tag that commit as `vX.Y.Z` and push the branch and tag.
-7. Wait for GitHub Actions to publish the GitHub Release artifacts.
-8. Restore every workflow `DECKR_REF` value to
-   `${{ vars.DECKR_REF || github.head_ref || github.ref_name }}`.
-9. Commit the restore as `Restore unpinned Deckr workflow ref` and push it.
+Build with the sibling `deckr-core-rust` checkout at the exact Git commit in
+`.deckr-core-revision`. CI uses that same commit for every target. After cloning
+`kws/deckr-core-rust` alongside this repository, select it with:
+
+```bash
+git -C ../deckr-core-rust checkout --detach "$(cat .deckr-core-revision)"
+cargo test --locked
+```
+
+The core owns Beacon/Concord lifetimes, descriptor validation, standard capability
+schemas, and command authorization. Queued output retains `HardwareCommandContext`
+and checks its authority before hardware writes. Hardware-specific protocol
+encoding, discovery, and safe reset behavior remain in this repository.

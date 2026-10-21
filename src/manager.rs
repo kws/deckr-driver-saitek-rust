@@ -401,7 +401,7 @@ impl SaitekHardwareHandler {
 }
 
 impl HardwareCommandHandler for SaitekHardwareHandler {
-    fn handle_authorized_hardware_command<'a>(
+    fn handle_hardware_command<'a>(
         &'a self,
         context: HardwareCommandContext,
     ) -> HardwareCommandFuture<'a> {

@@ -1,3 +1,6 @@
+use deckr::hardware::capabilities::{
+    button_momentary_value_schema, encoder_relative_value_schema, raster_bitmap_command_schema,
+};
 use deckr::lanes::{
     CapabilityConstraint, CapabilityDescriptor, CapabilitySchema, ControlDescriptor,
     ControlGeometry, DeviceDescriptor, DeviceRef, HardwareMessageBody,
@@ -233,15 +236,7 @@ fn button_momentary_capability() -> CapabilityDescriptor {
         capability_type: "momentary".to_string(),
         direction: "input".to_string(),
         access: vec!["emits".to_string()],
-        value_schema: Some(capability_schema(
-            "dev.deckr.value.input.button.momentary.v1",
-            json!({
-                "type": "object",
-                "required": ["eventType"],
-                "properties": {"eventType": {"enum": ["down", "up"]}},
-                "additionalProperties": false
-            }),
-        )),
+        value_schema: Some(button_momentary_value_schema()),
         command_schema: None,
         constraints: Vec::new(),
         event_types: vec!["down".to_string(), "up".to_string()],
@@ -257,18 +252,7 @@ fn encoder_relative_capability() -> CapabilityDescriptor {
         capability_type: "relative".to_string(),
         direction: "input".to_string(),
         access: vec!["emits".to_string()],
-        value_schema: Some(capability_schema(
-            "dev.deckr.value.input.encoder.relative.v1",
-            json!({
-                "type": "object",
-                "required": ["delta"],
-                "properties": {
-                    "delta": {"type": "integer", "not": {"const": 0}},
-                    "direction": {"enum": ["clockwise", "counterclockwise"]}
-                },
-                "additionalProperties": false
-            }),
-        )),
+        value_schema: Some(encoder_relative_value_schema()),
         command_schema: None,
         constraints: Vec::new(),
         event_types: vec!["rotate".to_string()],
@@ -285,25 +269,7 @@ fn raster_output_capability(width: u32, height: u32) -> CapabilityDescriptor {
         direction: "output".to_string(),
         access: vec!["settable".to_string()],
         value_schema: None,
-        command_schema: Some(capability_schema(
-            "dev.deckr.command.output.raster.bitmap.v1",
-            json!({
-                "oneOf": [
-                    {
-                        "type": "object",
-                        "required": ["image", "encoding"],
-                        "properties": {
-                            "image": {"type": "string", "contentEncoding": "base64"},
-                            "encoding": {"enum": ["jpeg", "png"]},
-                            "width": {"const": width},
-                            "height": {"const": height}
-                        },
-                        "additionalProperties": false
-                    },
-                    {"type": "object", "maxProperties": 0}
-                ]
-            }),
-        )),
+        command_schema: Some(raster_bitmap_command_schema(width, height)),
         constraints: vec![
             CapabilityConstraint {
                 constraint_type: "fixed".to_string(),
